@@ -1,0 +1,12 @@
+[package]
+name = "drift-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+drift-core = { path = "../drift-core" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

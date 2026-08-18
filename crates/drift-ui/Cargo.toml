@@ -1,0 +1,12 @@
+[package]
+name = "drift-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+gui = ["dep:gpui"]
+
+[dependencies]
+gpui = { workspace = true, optional = true }

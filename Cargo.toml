@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+	"crates/drift-app",
+	"crates/drift-core",
+	"crates/drift-network",
+	"crates/drift-protocol",
+	"crates/drift-relay",
+	"crates/drift-storage",
+	"crates/drift-transfer",
+	"crates/drift-cli",
+	"crates/drift-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+uuid = { version = "1.18", features = ["serde", "v4"] }
+async-trait = "0.1"
+gpui = "=0.2.2"
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

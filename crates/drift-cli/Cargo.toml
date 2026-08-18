@@ -1,0 +1,9 @@
+[package]
+name = "drift-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "drift-cli"
+path = "src/main.rs"

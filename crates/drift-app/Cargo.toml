@@ -1,0 +1,18 @@
+[package]
+name = "drift-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+gui = ["drift-ui/gui"]
+
+[[bin]]
+name = "drift"
+path = "src/main.rs"
+
+[dependencies]
+drift-ui = { path = "../drift-ui" }
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "drift-transfer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+drift-core = { path = "../drift-core" }
+drift-protocol = { path = "../drift-protocol" }
+tokio.workspace = true
+tracing.workspace = true
