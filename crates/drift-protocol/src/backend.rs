@@ -178,9 +178,15 @@ impl ReceiveRequest {
                 "receive request code must not be empty".into(),
             ));
         }
+        let output_directory = output_directory.into();
+        if output_directory.as_os_str().is_empty() {
+            return Err(BackendError::InvalidRequest(
+                "receive request output directory must not be empty".into(),
+            ));
+        }
         Ok(Self {
             code,
-            output_directory: output_directory.into(),
+            output_directory,
             relay: None,
         })
     }
@@ -196,7 +202,7 @@ impl fmt::Debug for ReceiveRequest {
         formatter
             .debug_struct("ReceiveRequest")
             .field("code", &"[REDACTED]")
-            .field("output_directory", &self.output_directory)
+            .field("output_directory_configured", &true)
             .field("relay", &self.relay)
             .finish()
     }
@@ -207,4 +213,24 @@ pub trait TransferBackend: Send + Sync {
     async fn send(&self, request: SendRequest) -> Result<TransferHandle, BackendError>;
 
     async fn receive(&self, request: ReceiveRequest) -> Result<TransferHandle, BackendError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receive_request_debug_redacts_code_and_destination() {
+        let request = ReceiveRequest::new("secret-code", "/private/receive-folder").unwrap();
+        let debug = format!("{request:?}");
+
+        assert!(!debug.contains("secret-code"));
+        assert!(!debug.contains("/private/receive-folder"));
+        assert!(debug.contains("output_directory_configured"));
+    }
+
+    #[test]
+    fn receive_request_rejects_empty_destination() {
+        assert!(ReceiveRequest::new("secret-code", PathBuf::new()).is_err());
+    }
 }

@@ -14,6 +14,59 @@ pub enum StorageError {
     Serialization(#[source] serde_json::Error),
 }
 
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationError {
+    #[error("destination path must not be empty")]
+    Empty,
+    #[error("destination path is unavailable")]
+    Unavailable,
+    #[error("destination path is not a directory")]
+    NotDirectory,
+    #[error("destination path is not writable")]
+    NotWritable,
+}
+
+pub async fn validate_receive_directory(path: impl AsRef<Path>) -> Result<(), DestinationError> {
+    let path = path.as_ref();
+    if path.as_os_str().is_empty() {
+        return Err(DestinationError::Empty);
+    }
+
+    let write_probe_directory = match fs::metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => path.to_path_buf(),
+        Ok(_) => return Err(DestinationError::NotDirectory),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            match fs::metadata(parent).await {
+                Ok(metadata) if metadata.is_dir() => parent.to_path_buf(),
+                _ => return Err(DestinationError::Unavailable),
+            }
+        }
+        Err(_) => return Err(DestinationError::Unavailable),
+    };
+
+    let probe = write_probe_directory.join(format!(".drift-write-check-{}", TransferId::new()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .await
+    {
+        Ok(_) => fs::remove_file(probe)
+            .await
+            .map_err(|_| DestinationError::NotWritable),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ) => Err(DestinationError::NotWritable),
+        Err(_) => Err(DestinationError::Unavailable),
+    }
+}
+
 pub struct JsonStore {
     root: PathBuf,
 }
@@ -112,6 +165,39 @@ mod tests {
         assert_eq!(store.load_resume(transfer_id).await.unwrap(), Some(state));
         store.remove_resume(transfer_id).await.unwrap();
         assert_eq!(store.load_resume(transfer_id).await.unwrap(), None);
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn validates_writable_receive_directory() {
+        let root = std::env::temp_dir().join(format!("drift-storage-destination-{}", TransferId::new()));
+        fs::create_dir_all(&root).await.unwrap();
+
+        assert_eq!(validate_receive_directory(&root).await, Ok(()));
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_file_and_unavailable_receive_destinations() {
+        let root = std::env::temp_dir().join(format!("drift-storage-destination-{}", TransferId::new()));
+        fs::create_dir_all(&root).await.unwrap();
+        let file = root.join("file");
+        fs::write(&file, b"not a directory").await.unwrap();
+
+        assert_eq!(
+            validate_receive_directory(PathBuf::new()).await,
+            Err(DestinationError::Empty)
+        );
+        assert_eq!(
+            validate_receive_directory(&file).await,
+            Err(DestinationError::NotDirectory)
+        );
+        assert_eq!(
+            validate_receive_directory(root.join("missing").join("nested")).await,
+            Err(DestinationError::Unavailable)
+        );
+
         let _ = fs::remove_dir_all(root).await;
     }
 }

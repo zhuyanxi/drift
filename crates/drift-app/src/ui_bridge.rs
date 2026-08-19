@@ -1,13 +1,14 @@
 use drift_core::{Role, TransferCapability, TransferEvent, TransferId};
 use drift_transfer::TransferNotification;
 use drift_ui::{
-    SendCommandError, SendCommandErrorKind, SendController, SendEvent, SendEventFuture,
-    SendEventStream, SendFuture, SendProgress,
+    ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture, ReceiveEventStream,
+    ReceiveFuture, SendCommandError, SendCommandErrorKind, SendController, SendEvent,
+    SendEventFuture, SendEventStream, SendFuture, SendProgress,
 };
 use std::{future::Future, path::PathBuf, pin::Pin};
 use tokio::sync::broadcast;
 
-use crate::{AppCommand, AppHandle};
+use crate::{AppCommand, AppCommandError, AppHandle};
 
 #[derive(Clone)]
 pub struct AppSendController {
@@ -65,7 +66,102 @@ impl SendController for AppSendController {
     }
 }
 
+#[derive(Clone)]
+pub struct AppReceiveController {
+    handle: AppHandle,
+}
+
+impl AppReceiveController {
+    pub fn new(handle: AppHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl ReceiveController for AppReceiveController {
+    fn default_destination(&self) -> Option<PathBuf> {
+        Some(self.handle.default_receive_directory())
+    }
+
+    fn validate_destination(
+        &self,
+        path: PathBuf,
+    ) -> ReceiveFuture<Result<(), ReceiveCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle.validate_destination(path).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(map_destination_error(&error)),
+                Err(_) => Err(ReceiveCommandError::destination_unavailable()),
+            }
+        })
+    }
+
+    fn preflight(&self) -> ReceiveFuture<Result<(), ReceiveCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle.preflight().await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) | Err(_) => Err(ReceiveCommandError::preflight_failed()),
+            }
+        })
+    }
+
+    fn start_receive(
+        &self,
+        code: String,
+        destination: PathBuf,
+    ) -> ReceiveFuture<Result<TransferId, ReceiveCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle
+                .dispatch(AppCommand::Receive {
+                    code,
+                    output_directory: Some(destination),
+                })
+                .await
+            {
+                Ok(Ok(transfer_id)) => Ok(transfer_id),
+                Ok(Err(_)) | Err(_) => Err(ReceiveCommandError::start_failed()),
+            }
+        })
+    }
+
+    fn cancel(&self, transfer_id: TransferId) -> ReceiveFuture<Result<(), ReceiveCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle.dispatch(AppCommand::Cancel { transfer_id }).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(_)) | Err(_) => Err(ReceiveCommandError::cancel_failed()),
+            }
+        })
+    }
+
+    fn subscribe(&self) -> Box<dyn ReceiveEventStream> {
+        Box::new(AppReceiveEventStream {
+            handle: self.handle.clone(),
+            receiver: self.handle.subscribe(),
+        })
+    }
+}
+
+fn map_destination_error(error: &AppCommandError) -> ReceiveCommandError {
+    match error {
+        AppCommandError::OutputDirectoryNotWritable => {
+            ReceiveCommandError::destination_not_writable()
+        }
+        AppCommandError::EmptyOutputDirectory | AppCommandError::OutputDirectoryUnavailable => {
+            ReceiveCommandError::destination_unavailable()
+        }
+        _ => ReceiveCommandError::destination_unavailable(),
+    }
+}
+
 struct AppSendEventStream {
+    handle: AppHandle,
+    receiver: broadcast::Receiver<TransferNotification>,
+}
+
+struct AppReceiveEventStream {
     handle: AppHandle,
     receiver: broadcast::Receiver<TransferNotification>,
 }
@@ -80,6 +176,23 @@ impl SendEventStream for AppSendEventStream {
                     Err(broadcast::error::RecvError::Closed) => return None,
                 };
                 if let Some(event) = map_notification(&self.handle, notification).await {
+                    return Some(event);
+                }
+            }
+        })
+    }
+}
+
+impl ReceiveEventStream for AppReceiveEventStream {
+    fn next(&mut self) -> ReceiveEventFuture<'_> {
+        Box::pin(async move {
+            loop {
+                let notification = match self.receiver.recv().await {
+                    Ok(notification) => notification,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                };
+                if let Some(event) = map_receive_notification(&self.handle, notification).await {
                     return Some(event);
                 }
             }
@@ -143,13 +256,64 @@ fn map_notification(
     }
 }
 
+fn map_receive_notification(
+    handle: &AppHandle,
+    notification: TransferNotification,
+) -> impl Future<Output = Option<ReceiveEvent>> + Send + '_ {
+    async move {
+        let transfer_id = notification.transfer_id;
+        let session = handle.session(transfer_id).await?;
+        if session.role != Role::Receiver {
+            return None;
+        }
+        Some(match notification.event {
+            TransferEvent::Created => ReceiveEvent::Created { transfer_id },
+            TransferEvent::Connecting => ReceiveEvent::Connecting { transfer_id },
+            TransferEvent::Authenticating => ReceiveEvent::Authenticating { transfer_id },
+            TransferEvent::Started => ReceiveEvent::Started { transfer_id },
+            TransferEvent::Progress {
+                transferred,
+                total,
+                speed_bps,
+            } => ReceiveEvent::Progress {
+                transfer_id,
+                transferred,
+                total,
+                speed_bps,
+            },
+            TransferEvent::CapabilityUnavailable { capability } => {
+                ReceiveEvent::CapabilityUnavailable {
+                    transfer_id,
+                    capability: match capability {
+                        TransferCapability::Progress => TransferCapability::Progress,
+                    },
+                }
+            }
+            TransferEvent::Verifying => ReceiveEvent::Verifying { transfer_id },
+            TransferEvent::Completed => ReceiveEvent::Completed { transfer_id },
+            TransferEvent::Failed => ReceiveEvent::Failed {
+                transfer_id,
+                message: session
+                    .error
+                    .unwrap_or_else(|| "The receive transfer failed.".to_owned()),
+            },
+            TransferEvent::Cancelled => ReceiveEvent::Cancelled { transfer_id },
+            TransferEvent::Connected
+            | TransferEvent::CodeAvailable
+            | TransferEvent::MetadataReady
+            | TransferEvent::Paused
+            | TransferEvent::Resumed => return None,
+        })
+    }
+}
+
 #[allow(dead_code)]
 type _SendEventFutureCheck<'a> = Pin<Box<dyn Future<Output = Option<SendEvent>> + Send + 'a>>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drift_ui::SendEvent;
+    use drift_ui::{ReceiveEvent, SendEvent};
 
     #[test]
     fn controller_error_messages_are_safe_for_ui() {
@@ -162,6 +326,18 @@ mod tests {
             SendEvent::CodeAvailable {
                 transfer_id: TransferId::new(),
                 code: "secret-code".into(),
+            }
+        )
+        .contains("secret-code"));
+        assert_eq!(
+            ReceiveCommandError::destination_not_writable().message(),
+            "The receive folder is not writable."
+        );
+        assert!(!format!(
+            "{:?}",
+            ReceiveEvent::Failed {
+                transfer_id: TransferId::new(),
+                message: "safe receive error".into(),
             }
         )
         .contains("secret-code"));

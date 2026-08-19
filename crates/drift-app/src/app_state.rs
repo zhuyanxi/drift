@@ -3,7 +3,7 @@ use crate::settings::{
 };
 use drift_core::TransferId;
 use drift_protocol::{BackendError, CrocBackend, ReceiveRequest, SendRequest};
-use drift_storage::JsonStore;
+use drift_storage::{validate_receive_directory, DestinationError, JsonStore};
 use drift_transfer::{TransferManager, TransferNotification};
 use std::{
     fmt,
@@ -141,6 +141,21 @@ impl AppHandle {
         })
     }
 
+    pub fn default_receive_directory(&self) -> PathBuf {
+        self.default_receive_directory.clone()
+    }
+
+    pub fn validate_destination(
+        &self,
+        path: PathBuf,
+    ) -> JoinHandle<Result<(), AppCommandError>> {
+        self.runtime.spawn(async move {
+            validate_receive_directory(path)
+                .await
+                .map_err(AppCommandError::from)
+        })
+    }
+
     pub fn dispatch(&self, command: AppCommand) -> JoinHandle<Result<TransferId, AppCommandError>> {
         let transfer_manager = self.transfer_manager.clone();
         let default_receive_directory = self.default_receive_directory.clone();
@@ -201,6 +216,12 @@ pub enum AppCommandError {
     InvalidRequest(#[source] BackendError),
     #[error("output directory must not be empty")]
     EmptyOutputDirectory,
+    #[error("output directory is unavailable")]
+    OutputDirectoryUnavailable,
+    #[error("output directory is not writable")]
+    OutputDirectoryNotWritable,
+    #[error("transfer code must not be empty")]
+    EmptyTransferCode,
     #[error("transfer command failed")]
     Transfer(#[source] drift_core::TransferError),
 }
@@ -211,7 +232,22 @@ impl AppCommandError {
             Self::Preflight(_) => "Croc is not ready.",
             Self::InvalidRequest(_) => "The transfer request is invalid.",
             Self::EmptyOutputDirectory => "The receive folder is unavailable.",
+            Self::OutputDirectoryUnavailable => "The receive folder is unavailable.",
+            Self::OutputDirectoryNotWritable => "The receive folder is not writable.",
+            Self::EmptyTransferCode => "Enter a transfer code.",
             Self::Transfer(_) => "The transfer could not start.",
+        }
+    }
+}
+
+impl From<DestinationError> for AppCommandError {
+    fn from(error: DestinationError) -> Self {
+        match error {
+            DestinationError::Empty => Self::EmptyOutputDirectory,
+            DestinationError::Unavailable | DestinationError::NotDirectory => {
+                Self::OutputDirectoryUnavailable
+            }
+            DestinationError::NotWritable => Self::OutputDirectoryNotWritable,
         }
     }
 }
@@ -234,9 +270,12 @@ async fn dispatch_command(
             output_directory,
         } => {
             let output_directory = output_directory.unwrap_or(default_receive_directory);
-            if output_directory.as_os_str().is_empty() {
-                return Err(AppCommandError::EmptyOutputDirectory);
+            if code.trim().is_empty() {
+                return Err(AppCommandError::EmptyTransferCode);
             }
+            validate_receive_directory(&output_directory)
+                .await
+                .map_err(AppCommandError::from)?;
             let request = ReceiveRequest::new(code, output_directory)
                 .map_err(AppCommandError::InvalidRequest)?;
             transfer_manager
@@ -324,5 +363,31 @@ mod tests {
         let debug = format!("{command:?}");
         assert!(!debug.contains("secret-transfer-code"));
         assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn receive_dispatch_rejects_unavailable_destination_before_backend() {
+        let root = temp_path();
+        let config_path = root.join("config").join("config.json");
+        let receive_directory = root.join("received");
+        fs::create_dir_all(&receive_directory).unwrap();
+        let mut settings = DriftSettings::default();
+        settings.transfer.default_receive_directory = receive_directory;
+        SettingsLoader::with_path(&config_path)
+            .save(&settings)
+            .unwrap();
+        let state = AppState::bootstrap_with_config_path(&config_path).unwrap();
+
+        let result = state.runtime.block_on(state.handle().dispatch(AppCommand::Receive {
+            code: "transfer-code".into(),
+            output_directory: Some(root.join("missing").join("nested")),
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            Err(AppCommandError::OutputDirectoryUnavailable)
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 }
