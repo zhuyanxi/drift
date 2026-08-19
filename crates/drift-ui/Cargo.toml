@@ -9,4 +9,5 @@ default = []
 gui = ["dep:gpui"]
 
 [dependencies]
+drift-core = { path = "../drift-core" }
 gpui = { workspace = true, optional = true }

@@ -42,6 +42,7 @@ pub struct AppState {
     settings: DriftSettings,
     settings_source: SettingsSource,
     config_path: PathBuf,
+    backend: CrocBackend,
     transfer_manager: TransferManager<CrocBackend>,
     resume_store: JsonStore,
     runtime: Runtime,
@@ -88,6 +89,7 @@ impl AppState {
     pub fn handle(&self) -> AppHandle {
         AppHandle {
             runtime: self.runtime.handle().clone(),
+            backend: self.backend.clone(),
             transfer_manager: self.transfer_manager.clone(),
             default_receive_directory: self.settings.transfer.default_receive_directory.clone(),
         }
@@ -104,13 +106,14 @@ impl AppState {
         if let Some(relay) = loaded.settings.relay.url.clone() {
             backend = backend.with_relay(relay);
         }
-        let transfer_manager = TransferManager::with_backend_name(backend, "croc");
+        let transfer_manager = TransferManager::with_backend_name(backend.clone(), "croc");
         let resume_store = JsonStore::new(resume_root(loader.path()));
 
         Ok(Self {
             settings: loaded.settings,
             settings_source: loaded.source,
             config_path: loader.path().to_path_buf(),
+            backend,
             transfer_manager,
             resume_store,
             runtime,
@@ -121,11 +124,23 @@ impl AppState {
 #[derive(Clone)]
 pub struct AppHandle {
     runtime: Handle,
+    backend: CrocBackend,
     transfer_manager: TransferManager<CrocBackend>,
     default_receive_directory: PathBuf,
 }
 
 impl AppHandle {
+    pub fn preflight(&self) -> JoinHandle<Result<(), AppCommandError>> {
+        let backend = self.backend.clone();
+        self.runtime.spawn(async move {
+            backend
+                .preflight()
+                .await
+                .map(|_| ())
+                .map_err(AppCommandError::Preflight)
+        })
+    }
+
     pub fn dispatch(&self, command: AppCommand) -> JoinHandle<Result<TransferId, AppCommandError>> {
         let transfer_manager = self.transfer_manager.clone();
         let default_receive_directory = self.default_receive_directory.clone();
@@ -136,6 +151,10 @@ impl AppHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<TransferNotification> {
         self.transfer_manager.subscribe()
+    }
+
+    pub async fn session(&self, transfer_id: TransferId) -> Option<drift_core::TransferSession> {
+        self.transfer_manager.session(transfer_id).await
     }
 }
 
@@ -176,12 +195,25 @@ impl fmt::Debug for AppCommand {
 
 #[derive(Debug, Error)]
 pub enum AppCommandError {
+    #[error("backend preflight failed")]
+    Preflight(#[source] BackendError),
     #[error("invalid transfer request")]
     InvalidRequest(#[source] BackendError),
     #[error("output directory must not be empty")]
     EmptyOutputDirectory,
     #[error("transfer command failed")]
     Transfer(#[source] drift_core::TransferError),
+}
+
+impl AppCommandError {
+    pub fn user_message(&self) -> &'static str {
+        match self {
+            Self::Preflight(_) => "Croc is not ready.",
+            Self::InvalidRequest(_) => "The transfer request is invalid.",
+            Self::EmptyOutputDirectory => "The receive folder is unavailable.",
+            Self::Transfer(_) => "The transfer could not start.",
+        }
+    }
 }
 
 async fn dispatch_command(

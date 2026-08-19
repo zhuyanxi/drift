@@ -1,4 +1,4 @@
-use drift_app::{logging, AppState};
+use drift_app::{logging, AppSendController, AppState};
 
 fn main() {
     logging::init();
@@ -10,7 +10,9 @@ fn main() {
                 custom_relay = app_state.custom_relay_configured(),
                 "drift services initialized"
             );
-            drift_ui::run_with_startup_error(None);
+            drift_ui::run_with_controller(std::sync::Arc::new(AppSendController::new(
+                app_state.handle(),
+            )));
             return;
         }
         Err(error) => {
