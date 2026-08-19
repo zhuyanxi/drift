@@ -8,6 +8,10 @@ use crate::TransferHandle;
 pub enum BackendError {
     #[error("invalid backend request: {0}")]
     InvalidRequest(String),
+    #[error(
+        "croc executable not found at {executable}; install Croc v11.2.x or configure its path"
+    )]
+    ExecutableMissing { executable: PathBuf },
     #[error("failed to spawn backend process")]
     Spawn(#[source] io::Error),
     #[error("backend process I/O failed")]
@@ -18,10 +22,110 @@ pub enum BackendError {
     Timeout { timeout: Duration },
     #[error("backend process cancelled")]
     Cancelled,
+    #[error("croc version invocation failed")]
+    VersionInvocation,
+    #[error("unsupported croc version {found}; Drift supports {supported}")]
+    UnsupportedVersion {
+        found: String,
+        supported: &'static str,
+    },
+    #[error("croc version output was not recognized")]
+    InvalidVersionOutput,
+    #[error("croc {stream} output violated the supported contract: {reason}")]
+    OutputParse {
+        stream: &'static str,
+        reason: &'static str,
+    },
+    #[error("croc did not provide the required {signal} signal")]
+    MissingSignal { signal: &'static str },
+    #[error("croc {stream} output exceeded the bounded diagnostic limit")]
+    OutputLimit { stream: &'static str },
     #[error("backend process exited with code {code:?}: {stderr}")]
     ProcessFailed { code: Option<i32>, stderr: String },
     #[error("backend process did not provide {stream} pipe")]
     MissingPipe { stream: &'static str },
+}
+
+impl BackendError {
+    pub fn safe_message(&self) -> String {
+        match self {
+            Self::InvalidRequest(_) => "invalid backend request".into(),
+            Self::ExecutableMissing { executable } => format!(
+                "croc executable unavailable at {}; install Croc v11.2.x or configure its path",
+                executable.display()
+            ),
+            Self::Spawn(_) => "failed to start the croc process".into(),
+            Self::Io(_) => "croc process I/O failed".into(),
+            Self::OutputTask(_) => "croc output reader failed".into(),
+            Self::Timeout { .. } => "croc process timed out".into(),
+            Self::Cancelled => "croc process cancelled".into(),
+            Self::VersionInvocation => "croc version check failed".into(),
+            Self::UnsupportedVersion { found, supported } => {
+                format!("unsupported croc version {found}; Drift supports {supported}")
+            }
+            Self::InvalidVersionOutput => "croc version output was not recognized".into(),
+            Self::OutputParse { .. } => "croc output was not recognized".into(),
+            Self::MissingSignal { signal } => format!("croc did not provide {signal}"),
+            Self::OutputLimit { .. } => "croc output exceeded the diagnostic limit".into(),
+            Self::ProcessFailed { .. } => "croc process failed".into(),
+            Self::MissingPipe { .. } => "croc process output was unavailable".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendCapability {
+    Progress,
+}
+
+impl fmt::Display for BackendCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Progress => formatter.write_str("progress reporting"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum BackendEvent {
+    CodeGenerated {
+        code: String,
+    },
+    MetadataReady,
+    Progress {
+        transferred: u64,
+        total: u64,
+        speed_bps: u64,
+    },
+    CapabilityUnavailable {
+        capability: BackendCapability,
+    },
+}
+
+impl fmt::Debug for BackendEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CodeGenerated { .. } => formatter
+                .debug_struct("BackendEvent::CodeGenerated")
+                .field("code", &"[REDACTED]")
+                .finish(),
+            Self::MetadataReady => formatter.write_str("BackendEvent::MetadataReady"),
+            Self::Progress {
+                transferred,
+                total,
+                speed_bps,
+            } => formatter
+                .debug_struct("BackendEvent::Progress")
+                .field("transferred", transferred)
+                .field("total", total)
+                .field("speed_bps", speed_bps)
+                .finish(),
+            Self::CapabilityUnavailable { capability } => formatter
+                .debug_struct("BackendEvent::CapabilityUnavailable")
+                .field("capability", capability)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

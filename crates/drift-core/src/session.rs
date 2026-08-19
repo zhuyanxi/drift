@@ -67,6 +67,7 @@ impl TransferState {
             (Self::Created, Self::Connecting)
                 | (Self::Connecting, Self::Authenticating)
                 | (Self::Authenticating, Self::Negotiating)
+                | (Self::Authenticating, Self::Transferring)
                 | (Self::Negotiating, Self::Transferring)
                 | (Self::Transferring, Self::Paused)
                 | (Self::Transferring, Self::Verifying)
@@ -94,12 +95,19 @@ pub enum TransferError {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferCapability {
+    Progress,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransferEvent {
     Created,
     Connecting,
     Connected,
     Authenticating,
+    Started,
+    CodeAvailable,
     MetadataReady,
     Progress {
         transferred: u64,
@@ -108,6 +116,9 @@ pub enum TransferEvent {
     },
     Paused,
     Resumed,
+    CapabilityUnavailable {
+        capability: TransferCapability,
+    },
     Verifying,
     Completed,
     Failed,
@@ -119,6 +130,7 @@ pub struct TransferSession {
     pub id: TransferId,
     pub role: Role,
     pub state: TransferState,
+    #[serde(skip)]
     pub code: Option<String>,
     pub created_at: u64,
     pub expires_at: Option<u64>,
@@ -189,6 +201,15 @@ impl TransferSession {
         speed_bps: u64,
     ) -> Result<(), crate::ProgressError> {
         let total = self.progress.total_bytes;
+        self.update_progress_with_total(transferred, total, speed_bps)
+    }
+
+    pub fn update_progress_with_total(
+        &mut self,
+        transferred: u64,
+        total: u64,
+        speed_bps: u64,
+    ) -> Result<(), crate::ProgressError> {
         self.progress = Progress::new(transferred, total, speed_bps)?;
         Ok(())
     }
@@ -228,5 +249,22 @@ mod tests {
         let debug = format!("{session:?}");
         assert!(!debug.contains("secret-code"));
         assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn does_not_serialize_transfer_code() {
+        let mut session = TransferSession::new(Role::Sender, "croc");
+        session.set_code("secret-code");
+        let serialized = serde_json::to_string(&session).unwrap();
+        assert!(!serialized.contains("secret-code"));
+        assert!(!serialized.contains("\"code\""));
+    }
+
+    #[test]
+    fn allows_backend_without_metadata_signal_to_start_transfer() {
+        let mut session = TransferSession::new(Role::Sender, "croc");
+        session.transition(TransferState::Connecting).unwrap();
+        session.transition(TransferState::Authenticating).unwrap();
+        session.transition(TransferState::Transferring).unwrap();
     }
 }

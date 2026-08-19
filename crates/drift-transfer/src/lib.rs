@@ -1,5 +1,11 @@
-use drift_core::{Role, TransferError, TransferEvent, TransferId, TransferSession, TransferState};
-use drift_protocol::{BackendError, ReceiveRequest, SendRequest, TransferBackend, TransferHandle};
+use drift_core::{
+    Role, TransferCapability, TransferError, TransferEvent, TransferId, TransferSession,
+    TransferState,
+};
+use drift_protocol::{
+    BackendCapability, BackendError, BackendEvent, ReceiveRequest, SendRequest, TransferBackend,
+    TransferHandle,
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -78,18 +84,8 @@ where
         .await?;
         self.advance(
             transfer_id,
-            TransferState::Negotiating,
-            TransferEvent::MetadataReady,
-        )
-        .await?;
-        self.advance(
-            transfer_id,
             TransferState::Transferring,
-            TransferEvent::Progress {
-                transferred: 0,
-                total: 0,
-                speed_bps: 0,
-            },
+            TransferEvent::Started,
         )
         .await?;
         self.track_and_monitor(transfer_id, handle).await;
@@ -101,6 +97,7 @@ where
         request: ReceiveRequest,
     ) -> Result<TransferId, TransferError> {
         let transfer_id = self.create_session(Role::Receiver).await;
+        self.store_code(transfer_id, request.code.clone()).await;
         self.advance(
             transfer_id,
             TransferState::Connecting,
@@ -120,18 +117,8 @@ where
         .await?;
         self.advance(
             transfer_id,
-            TransferState::Negotiating,
-            TransferEvent::MetadataReady,
-        )
-        .await?;
-        self.advance(
-            transfer_id,
             TransferState::Transferring,
-            TransferEvent::Progress {
-                transferred: 0,
-                total: 0,
-                speed_bps: 0,
-            },
+            TransferEvent::Started,
         )
         .await?;
         self.track_and_monitor(transfer_id, handle).await;
@@ -167,15 +154,120 @@ where
     }
 
     async fn track_and_monitor(&self, transfer_id: TransferId, handle: TransferHandle) {
+        let mut handle = handle;
+        let mut updates = handle.take_updates();
         let (cancel, cancellation) = oneshot::channel();
         let manager = Self {
             inner: Arc::clone(&self.inner),
         };
         self.inner.active.lock().await.insert(transfer_id, cancel);
         tokio::spawn(async move {
-            let result = handle.wait_with_cancel(cancellation).await;
+            let mut completion = Box::pin(handle.wait_with_cancel(cancellation));
+            let mut update_error = None;
+            let result = loop {
+                let Some(receiver) = updates.as_mut() else {
+                    break completion.await;
+                };
+                tokio::select! {
+                    result = &mut completion => break result,
+                    event = receiver.recv() => match event {
+                        Some(event) => {
+                            if let Err(error) = manager.apply_backend_event(transfer_id, event).await {
+                                update_error = Some(error);
+                            }
+                        }
+                        None => updates = None,
+                    },
+                }
+            };
+            if let Some(receiver) = updates.as_mut() {
+                while let Ok(event) = receiver.try_recv() {
+                    if let Err(error) = manager.apply_backend_event(transfer_id, event).await {
+                        update_error = Some(error);
+                    }
+                }
+            }
+            let result = match update_error {
+                Some(error) => Err(error),
+                None => result,
+            };
             manager.finish(transfer_id, result).await;
         });
+    }
+
+    async fn apply_backend_event(
+        &self,
+        transfer_id: TransferId,
+        event: BackendEvent,
+    ) -> Result<(), BackendError> {
+        match event {
+            BackendEvent::CodeGenerated { code } => {
+                self.store_code(transfer_id, code).await;
+            }
+            BackendEvent::MetadataReady => {
+                let state = self.session(transfer_id).await.map(|session| session.state);
+                if state == Some(TransferState::Negotiating) {
+                    self.advance(
+                        transfer_id,
+                        TransferState::Transferring,
+                        TransferEvent::MetadataReady,
+                    )
+                    .await
+                    .map_err(|_| BackendError::OutputParse {
+                        stream: "metadata",
+                        reason: "invalid metadata state",
+                    })?;
+                }
+            }
+            BackendEvent::Progress {
+                transferred,
+                total,
+                speed_bps,
+            } => {
+                let mut sessions = self.inner.sessions.write().await;
+                let session = sessions
+                    .get_mut(&transfer_id)
+                    .ok_or(BackendError::OutputParse {
+                        stream: "progress",
+                        reason: "missing transfer session",
+                    })?;
+                session
+                    .update_progress_with_total(transferred, total, speed_bps)
+                    .map_err(|_| BackendError::OutputParse {
+                        stream: "progress",
+                        reason: "progress exceeds total",
+                    })?;
+                drop(sessions);
+                self.emit(
+                    transfer_id,
+                    TransferEvent::Progress {
+                        transferred,
+                        total,
+                        speed_bps,
+                    },
+                );
+            }
+            BackendEvent::CapabilityUnavailable { capability } => {
+                let capability = match capability {
+                    BackendCapability::Progress => TransferCapability::Progress,
+                };
+                self.emit(
+                    transfer_id,
+                    TransferEvent::CapabilityUnavailable { capability },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn store_code(&self, transfer_id: TransferId, code: String) {
+        let mut sessions = self.inner.sessions.write().await;
+        let Some(session) = sessions.get_mut(&transfer_id) else {
+            return;
+        };
+        session.set_code(code);
+        drop(sessions);
+        self.emit(transfer_id, TransferEvent::CodeAvailable);
     }
 
     async fn finish(
@@ -212,7 +304,8 @@ where
                 }
             }
             Err(error) => {
-                warn!(%transfer_id, error = %error, "transfer backend failed");
+                let message = error.safe_message();
+                warn!(%transfer_id, error = %message, "transfer backend failed");
                 let _ = self.fail(transfer_id, error).await;
             }
         }
@@ -223,7 +316,7 @@ where
         transfer_id: TransferId,
         error: BackendError,
     ) -> Result<TransferId, TransferError> {
-        let message = error.to_string();
+        let message = error.safe_message();
         let mut sessions = self.inner.sessions.write().await;
         let session = sessions
             .get_mut(&transfer_id)
@@ -263,8 +356,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drift_core::StateTransitionError;
+    use drift_core::{StateTransitionError, TransferCapability};
     use drift_protocol::CrocBackend;
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    fn write_script(body: &str) -> PathBuf {
+        use std::{fs, os::unix::fs::PermissionsExt, time::SystemTime};
+
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("drift-transfer-test-{suffix}"));
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn versioned_script(body: &str) -> PathBuf {
+        write_script(&format!(
+            "if [ \"$1\" = \"--version\" ]; then printf 'v11.2.2-build\\n'; exit 0; fi\n{body}"
+        ))
+    }
 
     #[tokio::test]
     async fn serializes_state_changes_and_events() {
@@ -314,5 +431,73 @@ mod tests {
             TransferError::from(error).to_string(),
             "invalid state transition"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn propagates_code_and_capability_without_leaking_code_in_events() {
+        let script = versioned_script("sleep 0.05; printf 'Code is: manager-code\\n' >&2");
+        let manager = TransferManager::new(CrocBackend::new(&script));
+        let mut events = manager.subscribe();
+        let transfer_id = manager
+            .start_send(SendRequest::new(vec![PathBuf::from("ignored")]).unwrap())
+            .await
+            .unwrap();
+        let mut code_available = false;
+        let mut capability_unavailable = false;
+        let mut completed = false;
+        while !completed {
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            match notification.event {
+                TransferEvent::CodeAvailable => code_available = true,
+                TransferEvent::CapabilityUnavailable {
+                    capability: TransferCapability::Progress,
+                } => capability_unavailable = true,
+                TransferEvent::Completed => completed = true,
+                _ => {}
+            }
+        }
+        let session = manager.session(transfer_id).await.unwrap();
+        assert!(code_available);
+        assert!(capability_unavailable);
+        assert_eq!(session.code.as_deref(), Some("manager-code"));
+        assert_eq!(session.state, TransferState::Completed);
+        let debug = format!("{session:?}");
+        assert!(!debug.contains("manager-code"));
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stores_safe_message_for_backend_failure() {
+        let script = versioned_script("printf 'private diagnostic\\n' >&2; exit 7");
+        let manager = TransferManager::new(CrocBackend::new(&script));
+        let mut events = manager.subscribe();
+        let transfer_id = manager
+            .start_send(SendRequest::new(vec![PathBuf::from("ignored")]).unwrap())
+            .await
+            .unwrap();
+        loop {
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if notification.event == TransferEvent::Failed {
+                break;
+            }
+        }
+        let session = manager.session(transfer_id).await.unwrap();
+        assert_eq!(session.error.as_deref(), Some("croc process failed"));
+        assert!(!session
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("private diagnostic"));
+        let _ = std::fs::remove_file(script);
     }
 }
