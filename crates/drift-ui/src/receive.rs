@@ -35,6 +35,11 @@ pub trait ReceiveController: Send + Sync {
 
     fn cancel(&self, transfer_id: TransferId) -> ReceiveFuture<Result<(), ReceiveCommandError>>;
 
+    fn retry(
+        &self,
+        transfer_id: TransferId,
+    ) -> ReceiveFuture<Result<TransferId, ReceiveCommandError>>;
+
     fn subscribe(&self) -> Box<dyn ReceiveEventStream>;
 }
 
@@ -210,6 +215,9 @@ pub enum ReceiveIntent {
     Cancel {
         transfer_id: TransferId,
     },
+    Retry {
+        transfer_id: TransferId,
+    },
 }
 
 impl fmt::Debug for ReceiveIntent {
@@ -232,6 +240,10 @@ impl fmt::Debug for ReceiveIntent {
                 .finish(),
             Self::Cancel { transfer_id } => formatter
                 .debug_struct("Cancel")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::Retry { transfer_id } => formatter
+                .debug_struct("Retry")
                 .field("transfer_id", transfer_id)
                 .finish(),
         }
@@ -277,6 +289,7 @@ pub enum ReceiveEvent {
     Failed {
         transfer_id: TransferId,
         message: String,
+        retryable: bool,
     },
     Cancelled {
         transfer_id: TransferId,
@@ -289,6 +302,7 @@ impl fmt::Debug for ReceiveEvent {
             Self::Failed {
                 transfer_id,
                 message,
+                ..
             } => formatter
                 .debug_struct("Failed")
                 .field("transfer_id", transfer_id)
@@ -368,6 +382,8 @@ pub struct ReceiveViewState {
     destination_generation: u64,
     input_generation: u64,
     failure: Option<ReceiveFailure>,
+    retry_transfer_id: Option<TransferId>,
+    retryable: bool,
 }
 
 impl ReceiveViewState {
@@ -386,6 +402,8 @@ impl ReceiveViewState {
             destination_generation: 0,
             input_generation: 0,
             failure: None,
+            retry_transfer_id: None,
+            retryable: false,
         };
         if let Some(destination) = default_destination {
             state.set_destination(destination);
@@ -461,6 +479,10 @@ impl ReceiveViewState {
         self.error.as_deref()
     }
 
+    pub fn retry_enabled(&self) -> bool {
+        self.phase == ReceivePhase::Failed && self.retryable && self.retry_transfer_id.is_some()
+    }
+
     pub fn destination_validation_intent(&self) -> Option<ReceiveIntent> {
         self.destination.as_ref().map(|path| ReceiveIntent::ValidateDestination {
             generation: self.destination_generation,
@@ -479,7 +501,8 @@ impl ReceiveViewState {
         self.inputs_valid()
             && (self.phase == ReceivePhase::Ready
                 || (self.phase == ReceivePhase::Failed
-                    && self.failure == Some(ReceiveFailure::Start)))
+                    && self.failure == Some(ReceiveFailure::Start)
+                    && (self.retry_transfer_id.is_none() || self.retryable)))
     }
 
     pub fn choose_destination_enabled(&self) -> bool {
@@ -525,6 +548,8 @@ impl ReceiveViewState {
         };
         self.error = None;
         self.failure = None;
+        self.retry_transfer_id = None;
+        self.retryable = false;
         self.refresh_input_phase();
     }
 
@@ -538,6 +563,8 @@ impl ReceiveViewState {
         self.failure = None;
         self.active_transfer_id = None;
         self.progress = None;
+        self.retry_transfer_id = None;
+        self.retryable = false;
         self.phase = ReceivePhase::CheckingDestination;
         ReceiveIntent::ValidateDestination {
             generation: self.destination_generation,
@@ -563,6 +590,17 @@ impl ReceiveViewState {
             }
             ReceiveAction::Start if self.start_enabled() => {
                 let destination = self.destination.clone()?;
+                if self.retry_enabled() {
+                    let transfer_id = self.retry_transfer_id?;
+                    self.phase = ReceivePhase::Starting;
+                    self.progress = None;
+                    self.progress_available = true;
+                    self.error = None;
+                    self.failure = None;
+                    self.retry_transfer_id = None;
+                    self.retryable = false;
+                    return Some(ReceiveIntent::Retry { transfer_id });
+                }
                 self.phase = ReceivePhase::Starting;
                 self.progress = None;
                 self.progress_available = true;
@@ -641,6 +679,8 @@ impl ReceiveViewState {
             self.phase = ReceivePhase::Failed;
             self.failure = Some(ReceiveFailure::Start);
             self.active_transfer_id = None;
+            self.retry_transfer_id = None;
+            self.retryable = false;
             self.error = Some(ReceiveCommandError::start_failed().message().to_owned());
         }
     }
@@ -659,6 +699,8 @@ impl ReceiveViewState {
                     self.active_transfer_id = Some(transfer_id);
                     self.progress = None;
                     self.progress_available = true;
+                    self.retry_transfer_id = None;
+                    self.retryable = false;
                 }
             }
             ReceiveEvent::Connecting { transfer_id } => {
@@ -733,17 +775,22 @@ impl ReceiveViewState {
                 if self.accepts_transfer(transfer_id) {
                     self.phase = ReceivePhase::Completed;
                     self.active_transfer_id = None;
+                    self.retry_transfer_id = None;
+                    self.retryable = false;
                     self.error = None;
                 }
             }
             ReceiveEvent::Failed {
                 transfer_id,
                 message,
+                retryable,
             } => {
                 if self.accepts_transfer(transfer_id) {
                     self.phase = ReceivePhase::Failed;
                     self.failure = Some(ReceiveFailure::Start);
                     self.active_transfer_id = None;
+                    self.retry_transfer_id = Some(transfer_id);
+                    self.retryable = retryable;
                     self.error = Some(message);
                 }
             }
@@ -751,6 +798,8 @@ impl ReceiveViewState {
                 if self.accepts_transfer(transfer_id) {
                     self.phase = ReceivePhase::Cancelled;
                     self.active_transfer_id = None;
+                    self.retry_transfer_id = None;
+                    self.retryable = false;
                     self.error = None;
                 }
             }
@@ -980,5 +1029,52 @@ mod tests {
         state.apply_event(ReceiveEvent::Started { transfer_id });
         state.set_code("another-code");
         assert_eq!(state.code(), "transfer-code");
+    }
+
+    #[test]
+    fn retryable_receive_failure_reuses_inputs_with_new_attempt_identity() {
+        let mut state = ready_state();
+        state.handle_action(ReceiveAction::Start);
+        let old_transfer_id = TransferId::new();
+        state.apply_event(ReceiveEvent::Created {
+            transfer_id: old_transfer_id,
+        });
+        state.apply_event(ReceiveEvent::Failed {
+            transfer_id: old_transfer_id,
+            message: "The receive transfer failed.".into(),
+            retryable: true,
+        });
+
+        assert!(state.retry_enabled());
+        assert!(matches!(
+            state.handle_action(ReceiveAction::Start),
+            Some(ReceiveIntent::Retry { transfer_id }) if transfer_id == old_transfer_id
+        ));
+        let new_transfer_id = TransferId::new();
+        state.apply_event(ReceiveEvent::Created {
+            transfer_id: new_transfer_id,
+        });
+        assert_eq!(state.active_transfer_id(), Some(new_transfer_id));
+        assert!(!state.retry_enabled());
+        assert_eq!(state.code(), "transfer-code");
+    }
+
+    #[test]
+    fn non_retryable_receive_failure_requires_changed_input() {
+        let mut state = ready_state();
+        state.handle_action(ReceiveAction::Start);
+        let transfer_id = TransferId::new();
+        state.apply_event(ReceiveEvent::Created { transfer_id });
+        state.apply_event(ReceiveEvent::Failed {
+            transfer_id,
+            message: "The transfer code is invalid.".into(),
+            retryable: false,
+        });
+
+        assert!(!state.retry_enabled());
+        assert!(!state.start_enabled());
+        assert!(state.code_input_enabled());
+        state.set_code("replacement-code");
+        assert_eq!(state.code(), "replacement-code");
     }
 }

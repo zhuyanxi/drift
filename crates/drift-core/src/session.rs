@@ -81,6 +81,24 @@ impl TransferState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferFailureKind {
+    Network,
+    ProcessInterruption,
+    ProcessFailure,
+    InvalidRequest,
+    Filesystem,
+    Security,
+    Integrity,
+    Unknown,
+}
+
+impl TransferFailureKind {
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Network | Self::ProcessInterruption)
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("invalid transfer state transition: {from:?} -> {to:?}")]
 pub struct StateTransitionError {
@@ -100,6 +118,10 @@ pub enum TransferError {
     Backend(String),
     #[error("transfer cancelled")]
     Cancelled,
+    #[error("transfer cannot be cancelled in state {0:?}")]
+    CancelNotAllowed(TransferState),
+    #[error("transfer cannot be retried in state {0:?}")]
+    RetryNotAllowed(TransferState),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +168,7 @@ pub struct TransferSession {
     pub progress: Progress,
     pub backend: String,
     pub error: Option<String>,
+    pub failure_kind: Option<TransferFailureKind>,
 }
 
 impl fmt::Debug for TransferSession {
@@ -162,6 +185,7 @@ impl fmt::Debug for TransferSession {
             .field("progress", &self.progress)
             .field("backend", &self.backend)
             .field("error", &self.error)
+            .field("failure_kind", &self.failure_kind)
             .finish()
     }
 }
@@ -179,6 +203,7 @@ impl TransferSession {
             progress: Progress::new(0, 0, 0).expect("zero progress is valid"),
             backend: backend.into(),
             error: None,
+            failure_kind: None,
         }
     }
 

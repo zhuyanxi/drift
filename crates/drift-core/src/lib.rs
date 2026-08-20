@@ -8,6 +8,6 @@ pub use manifest::{
 };
 pub use progress::{Progress, ProgressError};
 pub use session::{
-    Role, StateTransitionError, TransferCapability, TransferError, TransferEvent, TransferId,
-    TransferSession, TransferState,
+    Role, StateTransitionError, TransferCapability, TransferError, TransferEvent,
+    TransferFailureKind, TransferId, TransferSession, TransferState,
 };

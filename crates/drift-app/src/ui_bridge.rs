@@ -97,6 +97,19 @@ impl SendController for AppSendController {
         })
     }
 
+    fn retry(&self, transfer_id: TransferId) -> SendFuture<Result<TransferId, SendCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle
+                .dispatch(AppCommand::RetryTransfer { transfer_id })
+                .await
+            {
+                Ok(Ok(transfer_id)) => Ok(transfer_id),
+                Ok(Err(_)) | Err(_) => Err(SendCommandError::start_failed()),
+            }
+        })
+    }
+
     fn subscribe(&self) -> Box<dyn SendEventStream> {
         Box::new(AppSendEventStream {
             handle: self.handle.clone(),
@@ -204,6 +217,22 @@ impl ReceiveController for AppReceiveController {
         })
     }
 
+    fn retry(
+        &self,
+        transfer_id: TransferId,
+    ) -> ReceiveFuture<Result<TransferId, ReceiveCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle
+                .dispatch(AppCommand::RetryTransfer { transfer_id })
+                .await
+            {
+                Ok(Ok(transfer_id)) => Ok(transfer_id),
+                Ok(Err(_)) | Err(_) => Err(ReceiveCommandError::start_failed()),
+            }
+        })
+    }
+
     fn subscribe(&self) -> Box<dyn ReceiveEventStream> {
         Box::new(AppReceiveEventStream {
             handle: self.handle.clone(),
@@ -287,6 +316,7 @@ fn map_notification(
         if presentation.role != Role::Sender {
             return None;
         }
+        let retryable = presentation.retryable();
         Some(match event {
             TransferEvent::Created => SendEvent::Created { transfer_id },
             TransferEvent::Connecting => SendEvent::Connecting { transfer_id },
@@ -325,6 +355,7 @@ fn map_notification(
                 message: presentation
                     .error
                     .unwrap_or_else(|| "The transfer failed.".to_owned()),
+                retryable,
             },
             TransferEvent::Cancelled => SendEvent::Cancelled { transfer_id },
             TransferEvent::MetadataReady | TransferEvent::Paused | TransferEvent::Resumed => {
@@ -347,6 +378,7 @@ fn map_receive_notification(
         if presentation.role != Role::Receiver {
             return None;
         }
+        let retryable = presentation.retryable();
         Some(match event {
             TransferEvent::Created => ReceiveEvent::Created { transfer_id },
             TransferEvent::Connecting => ReceiveEvent::Connecting { transfer_id },
@@ -379,6 +411,7 @@ fn map_receive_notification(
                 message: presentation
                     .error
                     .unwrap_or_else(|| "The receive transfer failed.".to_owned()),
+                retryable,
             },
             TransferEvent::Cancelled => ReceiveEvent::Cancelled { transfer_id },
             TransferEvent::CodeAvailable
@@ -420,6 +453,7 @@ mod tests {
             ReceiveEvent::Failed {
                 transfer_id: TransferId::new(),
                 message: "safe receive error".into(),
+                retryable: false,
             }
         )
         .contains("secret-code"));

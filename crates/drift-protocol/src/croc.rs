@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use std::{
     ffi::OsString,
     fmt,
+    future::Future,
     path::{Path, PathBuf},
     process::ExitStatus,
     time::Duration,
@@ -411,9 +412,23 @@ impl TransferHandle {
     }
 
     pub async fn wait_with_cancel(
-        mut self,
-        mut cancellation: tokio::sync::oneshot::Receiver<()>,
+        self,
+        cancellation: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<TransferOutput, BackendError> {
+        self.wait_with_cancel_signal(async move {
+            let _ = cancellation.await;
+        })
+        .await
+    }
+
+    pub async fn wait_with_cancel_signal<F>(
+        mut self,
+        cancellation: F,
+    ) -> Result<TransferOutput, BackendError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let mut cancellation = Box::pin(cancellation);
         let status = tokio::select! {
             result = time::timeout(self.timeout, self.child.wait()) => match result {
                 Ok(Ok(status)) => status,

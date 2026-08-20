@@ -1,4 +1,6 @@
-use drift_core::{Progress, Role, TransferEvent, TransferId, TransferSession, TransferState};
+use drift_core::{
+    Progress, Role, TransferEvent, TransferFailureKind, TransferId, TransferSession, TransferState,
+};
 use drift_protocol::CrocBackend;
 use drift_transfer::{TransferManager, TransferNotification};
 use std::{
@@ -24,6 +26,7 @@ pub struct TransferPresentation {
     pub progress: Progress,
     pub code_available: bool,
     pub error: Option<String>,
+    pub failure_kind: Option<TransferFailureKind>,
 }
 
 impl TransferPresentation {
@@ -38,6 +41,11 @@ impl TransferPresentation {
         }
     }
 
+    pub fn retryable(&self) -> bool {
+        self.failure_kind
+            .is_some_and(TransferFailureKind::is_retryable)
+    }
+
     fn from_session(session: &TransferSession) -> Self {
         Self {
             transfer_id: session.id,
@@ -46,6 +54,7 @@ impl TransferPresentation {
             progress: session.progress,
             code_available: session.code.is_some(),
             error: session.error.clone(),
+            failure_kind: session.failure_kind,
         }
     }
 }
@@ -205,6 +214,7 @@ fn apply_event_to_presentation(
                 };
                 presentation.code_available = false;
                 presentation.error = None;
+                presentation.failure_kind = None;
             }
             presentation.state = next_state;
         }
@@ -223,6 +233,7 @@ fn apply_event_to_presentation(
             };
             presentation.state = next_state;
             presentation.error = None;
+            presentation.failure_kind = None;
             if !had_previous {
                 presentation.code_available = session.code.is_some();
             }
@@ -244,11 +255,13 @@ fn apply_event_to_presentation(
             presentation.state = next_state;
             presentation.code_available = false;
             presentation.error = None;
+            presentation.failure_kind = None;
         }
         TransferEvent::Failed => {
             presentation.state = next_state;
             presentation.code_available = false;
             presentation.error = session.error.clone();
+            presentation.failure_kind = session.failure_kind;
         }
     }
     Some(())
@@ -423,6 +436,7 @@ mod tests {
             },
             code_available: false,
             error: None,
+            failure_kind: None,
         }
     }
 

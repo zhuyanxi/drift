@@ -31,6 +31,8 @@ pub trait SendController: Send + Sync {
 
     fn cancel(&self, transfer_id: TransferId) -> SendFuture<Result<(), SendCommandError>>;
 
+    fn retry(&self, transfer_id: TransferId) -> SendFuture<Result<TransferId, SendCommandError>>;
+
     fn subscribe(&self) -> Box<dyn SendEventStream>;
 }
 
@@ -306,6 +308,9 @@ pub enum SendIntent {
     Cancel {
         transfer_id: TransferId,
     },
+    Retry {
+        transfer_id: TransferId,
+    },
 }
 
 impl fmt::Debug for SendIntent {
@@ -328,6 +333,10 @@ impl fmt::Debug for SendIntent {
                 .finish(),
             Self::Cancel { transfer_id } => formatter
                 .debug_struct("Cancel")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::Retry { transfer_id } => formatter
+                .debug_struct("Retry")
                 .field("transfer_id", transfer_id)
                 .finish(),
         }
@@ -375,6 +384,7 @@ pub enum SendEvent {
     Failed {
         transfer_id: TransferId,
         message: String,
+        retryable: bool,
     },
     Cancelled {
         transfer_id: TransferId,
@@ -392,6 +402,7 @@ impl fmt::Debug for SendEvent {
             Self::Failed {
                 transfer_id,
                 message,
+                ..
             } => formatter
                 .debug_struct("Failed")
                 .field("transfer_id", transfer_id)
@@ -556,6 +567,8 @@ pub struct SendViewState {
     copy_feedback: Option<CopyFeedback>,
     error: Option<String>,
     selection_generation: u64,
+    retry_transfer_id: Option<TransferId>,
+    retryable: bool,
 }
 
 impl Default for SendViewState {
@@ -576,6 +589,8 @@ impl SendViewState {
             copy_feedback: None,
             error: None,
             selection_generation: 0,
+            retry_transfer_id: None,
+            retryable: false,
         }
     }
 
@@ -627,12 +642,22 @@ impl SendViewState {
         self.error.as_deref()
     }
 
+    pub fn retry_enabled(&self) -> bool {
+        self.phase == SendPhase::Failed && self.retryable && self.retry_transfer_id.is_some()
+    }
+
     pub fn start_enabled(&self) -> bool {
-        matches!(self.phase, SendPhase::Ready | SendPhase::Failed)
+        (matches!(self.phase, SendPhase::Ready)
             && self
                 .selection
                 .as_ref()
-                .is_some_and(|selection| selection.manifest().is_some())
+                .is_some_and(|selection| selection.manifest().is_some()))
+            || (self.phase == SendPhase::Failed
+                && (self.retry_transfer_id.is_none() || self.retryable)
+                && self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.manifest().is_some()))
     }
 
     pub fn clear_enabled(&self) -> bool {
@@ -677,6 +702,8 @@ impl SendViewState {
         self.progress_available = true;
         self.copy_feedback = None;
         self.error = None;
+        self.retry_transfer_id = None;
+        self.retryable = false;
         self.phase = SendPhase::Preflighting;
         self.preflight_intent()
     }
@@ -701,6 +728,8 @@ impl SendViewState {
         self.progress_available = true;
         self.copy_feedback = None;
         self.error = None;
+        self.retry_transfer_id = None;
+        self.retryable = false;
         self.phase = SendPhase::Scanning;
         Some(self.selection_generation)
     }
@@ -734,6 +763,8 @@ impl SendViewState {
                 self.progress = None;
                 self.copy_feedback = None;
                 self.error = None;
+                self.retry_transfer_id = None;
+                self.retryable = false;
                 self.phase = SendPhase::Choosing;
                 Some(SendIntent::Choose)
             }
@@ -745,6 +776,8 @@ impl SendViewState {
                 self.progress = None;
                 self.copy_feedback = None;
                 self.error = None;
+                self.retry_transfer_id = None;
+                self.retryable = false;
                 self.phase = SendPhase::Empty;
                 Some(SendIntent::CancelScan)
             }
@@ -763,6 +796,8 @@ impl SendViewState {
                 self.selection_generation = self.selection_generation.saturating_add(1);
                 self.copy_feedback = None;
                 self.error = None;
+                self.retry_transfer_id = None;
+                self.retryable = false;
                 if selection.items.is_empty() {
                     self.selection = None;
                     self.phase = SendPhase::Empty;
@@ -774,6 +809,16 @@ impl SendViewState {
             }
             SendAction::Start if self.start_enabled() => {
                 if self.phase == SendPhase::Failed {
+                    if self.retry_enabled() {
+                        let transfer_id = self.retry_transfer_id?;
+                        self.phase = SendPhase::Starting;
+                        self.progress = None;
+                        self.progress_available = true;
+                        self.error = None;
+                        self.retry_transfer_id = None;
+                        self.retryable = false;
+                        return Some(SendIntent::Retry { transfer_id });
+                    }
                     self.phase = SendPhase::Preflighting;
                     self.progress = None;
                     self.progress_available = true;
@@ -788,6 +833,8 @@ impl SendViewState {
                 self.progress = None;
                 self.progress_available = true;
                 self.error = None;
+                self.retry_transfer_id = None;
+                self.retryable = false;
                 let manifest = self
                     .selection
                     .as_ref()
@@ -857,6 +904,8 @@ impl SendViewState {
             self.phase = SendPhase::Failed;
             self.active_transfer_id = None;
             self.code = None;
+            self.retry_transfer_id = None;
+            self.retryable = false;
             self.error = Some(SendCommandError::start_failed().message().to_owned());
         }
     }
@@ -887,6 +936,8 @@ impl SendViewState {
                     self.active_transfer_id = Some(transfer_id);
                     self.progress = None;
                     self.progress_available = true;
+                    self.retry_transfer_id = None;
+                    self.retryable = false;
                 }
             }
             SendEvent::Connecting { transfer_id } => {
@@ -972,16 +1023,21 @@ impl SendViewState {
                     self.phase = SendPhase::Completed;
                     self.active_transfer_id = None;
                     self.code = None;
+                    self.retry_transfer_id = None;
+                    self.retryable = false;
                 }
             }
             SendEvent::Failed {
                 transfer_id,
                 message,
+                retryable,
             } => {
                 if self.accepts_transfer(transfer_id) {
                     self.phase = SendPhase::Failed;
                     self.active_transfer_id = None;
                     self.code = None;
+                    self.retry_transfer_id = Some(transfer_id);
+                    self.retryable = retryable;
                     self.error = Some(message);
                 }
             }
@@ -990,6 +1046,8 @@ impl SendViewState {
                     self.phase = SendPhase::Cancelled;
                     self.active_transfer_id = None;
                     self.code = None;
+                    self.retry_transfer_id = None;
+                    self.retryable = false;
                 }
             }
         }
@@ -1248,6 +1306,7 @@ mod tests {
         failed.apply_event(SendEvent::Failed {
             transfer_id,
             message: "The transfer could not start.".into(),
+            retryable: false,
         });
         assert_eq!(failed.phase(), SendPhase::Failed);
         assert_eq!(failed.active_transfer_id(), None);
@@ -1271,6 +1330,62 @@ mod tests {
         cancelled.apply_event(SendEvent::Cancelled { transfer_id });
         assert_eq!(cancelled.phase(), SendPhase::Cancelled);
         assert_eq!(cancelled.active_transfer_id(), None);
+    }
+
+    #[test]
+    fn retryable_failure_starts_distinct_attempt_without_rebuilding_selection() {
+        let mut state = SendViewState::new();
+        let generation = match state.set_selection(selection()) {
+            SendIntent::Preflight { generation, .. } => generation,
+            other => panic!("unexpected intent: {other:?}"),
+        };
+        state.mark_preflight_succeeded(generation);
+        state.handle_action(SendAction::Start);
+        let old_transfer_id = TransferId::new();
+        state.apply_event(SendEvent::Created {
+            transfer_id: old_transfer_id,
+        });
+        state.apply_event(SendEvent::Failed {
+            transfer_id: old_transfer_id,
+            message: "The transfer failed.".into(),
+            retryable: true,
+        });
+
+        assert!(state.retry_enabled());
+        assert!(matches!(
+            state.handle_action(SendAction::Start),
+            Some(SendIntent::Retry { transfer_id }) if transfer_id == old_transfer_id
+        ));
+        let new_transfer_id = TransferId::new();
+        state.apply_event(SendEvent::Created {
+            transfer_id: new_transfer_id,
+        });
+        assert_eq!(state.active_transfer_id(), Some(new_transfer_id));
+        assert!(!state.retry_enabled());
+        assert_eq!(state.selection().unwrap().item_count(), 2);
+    }
+
+    #[test]
+    fn non_retryable_failure_disables_automatic_retry_but_keeps_selection() {
+        let mut state = SendViewState::new();
+        let generation = match state.set_selection(selection()) {
+            SendIntent::Preflight { generation, .. } => generation,
+            other => panic!("unexpected intent: {other:?}"),
+        };
+        state.mark_preflight_succeeded(generation);
+        state.handle_action(SendAction::Start);
+        let transfer_id = TransferId::new();
+        state.apply_event(SendEvent::Created { transfer_id });
+        state.apply_event(SendEvent::Failed {
+            transfer_id,
+            message: "The request is invalid.".into(),
+            retryable: false,
+        });
+
+        assert!(!state.retry_enabled());
+        assert!(!state.start_enabled());
+        assert!(state.choose_enabled());
+        assert_eq!(state.selection().unwrap().item_count(), 2);
     }
 
     #[test]

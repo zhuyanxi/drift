@@ -93,6 +93,13 @@ mod gui {
             Box::pin(async { Err(SendCommandError::cancel_failed()) })
         }
 
+        fn retry(
+            &self,
+            _transfer_id: drift_core::TransferId,
+        ) -> super::SendFuture<Result<drift_core::TransferId, SendCommandError>> {
+            Box::pin(async { Err(SendCommandError::start_failed()) })
+        }
+
         fn subscribe(&self) -> Box<dyn SendEventStream> {
             Box::new(EmptySendEventStream)
         }
@@ -133,6 +140,13 @@ mod gui {
             _transfer_id: drift_core::TransferId,
         ) -> super::ReceiveFuture<Result<(), ReceiveCommandError>> {
             Box::pin(async { Err(ReceiveCommandError::cancel_failed()) })
+        }
+
+        fn retry(
+            &self,
+            _transfer_id: drift_core::TransferId,
+        ) -> super::ReceiveFuture<Result<drift_core::TransferId, ReceiveCommandError>> {
+            Box::pin(async { Err(ReceiveCommandError::start_failed()) })
         }
 
         fn subscribe(&self) -> Box<dyn ReceiveEventStream> {
@@ -276,6 +290,7 @@ mod gui {
                     self.start_preflight(generation, paths, cx)
                 }
                 SendIntent::Start { paths, manifest } => self.start_transfer(paths, manifest, cx),
+                SendIntent::Retry { transfer_id } => self.retry_transfer(transfer_id, cx),
                 SendIntent::CopyCode { code } => {
                     let result = self.clipboard.copy(&code, cx);
                     self.send.mark_copy_result(result);
@@ -304,6 +319,9 @@ mod gui {
                 }
                 ReceiveIntent::Start { code, destination } => {
                     self.start_receive_transfer(code, destination, cx)
+                }
+                ReceiveIntent::Retry { transfer_id } => {
+                    self.retry_receive_transfer(transfer_id, cx)
                 }
                 ReceiveIntent::Cancel { transfer_id } => {
                     self.cancel_receive_transfer(transfer_id, cx)
@@ -440,6 +458,32 @@ mod gui {
                             view.receive.mark_cancel_failed();
                             cx.notify();
                         });
+                    }
+                },
+            ));
+        }
+
+        fn retry_receive_transfer(
+            &mut self,
+            transfer_id: drift_core::TransferId,
+            cx: &mut Context<Self>,
+        ) {
+            let controller = Arc::clone(&self.receive_controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    match controller.retry(transfer_id).await {
+                        Ok(new_transfer_id) => {
+                            let _ = this.update(&mut *cx, |view, cx| {
+                                view.receive.mark_start_succeeded(new_transfer_id);
+                                cx.notify();
+                            });
+                        }
+                        Err(_) => {
+                            let _ = this.update(&mut *cx, |view, cx| {
+                                view.receive.mark_start_failed();
+                                cx.notify();
+                            });
+                        }
                     }
                 },
             ));
@@ -652,6 +696,28 @@ mod gui {
             ));
         }
 
+        fn retry_transfer(&mut self, transfer_id: drift_core::TransferId, cx: &mut Context<Self>) {
+            let controller = Arc::clone(&self.controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    match controller.retry(transfer_id).await {
+                        Ok(new_transfer_id) => {
+                            let _ = this.update(&mut *cx, |view, cx| {
+                                view.send.mark_start_succeeded(new_transfer_id);
+                                cx.notify();
+                            });
+                        }
+                        Err(_) => {
+                            let _ = this.update(&mut *cx, |view, cx| {
+                                view.send.mark_start_failed();
+                                cx.notify();
+                            });
+                        }
+                    }
+                },
+            ));
+        }
+
         fn render_error(&self) -> AnyElement {
             div()
                 .size_full()
@@ -800,8 +866,10 @@ mod gui {
                         ))
                         .child(action_button(
                             "send-start",
-                            if phase == SendPhase::Failed {
-                                "Retry"
+                            if self.send.retry_enabled() {
+                                "Retry transfer"
+                            } else if phase == SendPhase::Failed && self.send.start_enabled() {
+                                "Retry check"
                             } else {
                                 "Start transfer"
                             },
@@ -947,7 +1015,7 @@ mod gui {
                         .gap_2()
                         .child(action_button(
                             "receive-preflight",
-                            if phase == ReceivePhase::Failed {
+                            if phase == ReceivePhase::Failed && self.receive.preflight_enabled() {
                                 "Retry check"
                             } else {
                                 "Check Croc"
@@ -957,7 +1025,7 @@ mod gui {
                         ))
                         .child(action_button(
                             "receive-start",
-                            if phase == ReceivePhase::Failed {
+                            if self.receive.retry_enabled() {
                                 "Retry receive"
                             } else {
                                 "Receive"

@@ -195,6 +195,9 @@ pub enum AppCommand {
     Cancel {
         transfer_id: TransferId,
     },
+    RetryTransfer {
+        transfer_id: TransferId,
+    },
 }
 
 impl fmt::Debug for AppCommand {
@@ -213,6 +216,10 @@ impl fmt::Debug for AppCommand {
                 .finish(),
             Self::Cancel { transfer_id } => formatter
                 .debug_struct("Cancel")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::RetryTransfer { transfer_id } => formatter
+                .debug_struct("RetryTransfer")
                 .field("transfer_id", transfer_id)
                 .finish(),
         }
@@ -298,6 +305,10 @@ async fn dispatch_command(
             .cancel(transfer_id)
             .await
             .map(|()| transfer_id)
+            .map_err(AppCommandError::Transfer),
+        AppCommand::RetryTransfer { transfer_id } => transfer_manager
+            .retry(transfer_id)
+            .await
             .map_err(AppCommandError::Transfer),
     }
 }

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use drift_core::TransferFailureKind;
 use std::{fmt, io, path::PathBuf, time::Duration};
 use thiserror::Error;
 
@@ -47,6 +48,25 @@ pub enum BackendError {
 }
 
 impl BackendError {
+    pub fn failure_kind(&self) -> TransferFailureKind {
+        match self {
+            Self::InvalidRequest(_) => TransferFailureKind::InvalidRequest,
+            Self::ExecutableMissing { .. } | Self::Spawn(_) | Self::MissingPipe { .. } => {
+                TransferFailureKind::Filesystem
+            }
+            Self::Io(_) | Self::OutputTask(_) => TransferFailureKind::ProcessInterruption,
+            Self::Timeout { .. } => TransferFailureKind::Network,
+            Self::Cancelled => TransferFailureKind::Unknown,
+            Self::VersionInvocation
+            | Self::UnsupportedVersion { .. }
+            | Self::InvalidVersionOutput
+            | Self::OutputParse { .. }
+            | Self::MissingSignal { .. }
+            | Self::OutputLimit { .. }
+            | Self::ProcessFailed { .. } => TransferFailureKind::ProcessFailure,
+        }
+    }
+
     pub fn safe_message(&self) -> String {
         match self {
             Self::InvalidRequest(_) => "invalid backend request".into(),
