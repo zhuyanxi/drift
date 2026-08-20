@@ -123,10 +123,7 @@ impl TransferManifest {
         let mut paths = self
             .files
             .iter()
-            .map(|file| {
-                sanitize_relative_path(&file.relative_path)?;
-                Ok(file.relative_path.clone())
-            })
+            .map(|file| sanitize_relative_path(&file.relative_path))
             .collect::<Result<Vec<_>, ManifestError>>()?;
         paths.sort();
         if paths
@@ -342,6 +339,32 @@ mod tests {
             total_size: 2,
         };
         assert_eq!(conflict.validate(), Err(ManifestError::DuplicatePath));
+    }
+
+    #[test]
+    fn rejects_duplicate_paths_after_normalization() {
+        let duplicate = TransferManifest {
+            transfer_id: TransferId::new(),
+            files: vec![
+                FileEntry {
+                    file_id: Uuid::new_v4(),
+                    relative_path: PathBuf::from("folder/file.txt"),
+                    size: 1,
+                    modified_at: None,
+                    digest: None,
+                },
+                FileEntry {
+                    file_id: Uuid::new_v4(),
+                    relative_path: PathBuf::from(r"folder\file.txt"),
+                    size: 1,
+                    modified_at: None,
+                    digest: None,
+                },
+            ],
+            total_size: 2,
+        };
+
+        assert_eq!(duplicate.validate(), Err(ManifestError::DuplicatePath));
     }
 
     #[test]

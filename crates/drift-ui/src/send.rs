@@ -437,6 +437,7 @@ pub enum SendCommandErrorKind {
     SymlinkNotAllowed,
     UnsupportedFileType,
     EmptyDirectory,
+    TooManyEntries,
     DuplicatePath,
     InvalidRelativePath,
     ScanCancelled,
@@ -473,6 +474,9 @@ impl SendCommandError {
             }
             SendCommandErrorKind::EmptyDirectory => {
                 "A selected directory contains no regular files."
+            }
+            SendCommandErrorKind::TooManyEntries => {
+                "A selected directory contains too many entries."
             }
             SendCommandErrorKind::DuplicatePath => {
                 "Selected sources contain duplicate output paths."

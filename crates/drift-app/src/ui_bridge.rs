@@ -124,6 +124,7 @@ fn map_source_scan_error(error: SourceScanError) -> SendCommandError {
         SourceScanError::SymlinkNotAllowed => SendCommandErrorKind::SymlinkNotAllowed,
         SourceScanError::UnsupportedFileType => SendCommandErrorKind::UnsupportedFileType,
         SourceScanError::EmptyDirectory => SendCommandErrorKind::EmptyDirectory,
+        SourceScanError::TooManyEntries => SendCommandErrorKind::TooManyEntries,
         SourceScanError::DuplicatePath => SendCommandErrorKind::DuplicatePath,
         SourceScanError::InvalidRelativePath => SendCommandErrorKind::InvalidRelativePath,
         SourceScanError::Cancelled => SendCommandErrorKind::ScanCancelled,

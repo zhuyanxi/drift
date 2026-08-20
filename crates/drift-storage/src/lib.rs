@@ -53,6 +53,8 @@ pub enum SourceScanError {
     EmptyDirectory,
     #[error("source path has no valid name")]
     InvalidRoot,
+    #[error("source directory contains too many entries")]
+    TooManyEntries,
     #[error("source contains duplicate or conflicting output paths")]
     DuplicatePath,
     #[error("source path cannot be represented as a relative manifest path")]
@@ -264,7 +266,7 @@ async fn scan_directory(
             check_cancelled(cancellation)?;
             entries.push(entry.path());
             if entries.len() > MAX_SCAN_DIRECTORY_ENTRIES {
-                return Err(SourceScanError::SizeOverflow);
+                return Err(SourceScanError::TooManyEntries);
             }
         }
         entries.sort();
@@ -650,6 +652,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_directories_over_entry_bound_with_actionable_error() {
+        let root = scan_root("too-many-entries");
+        fs::create_dir_all(&root).await.unwrap();
+        for index in 0..=MAX_SCAN_DIRECTORY_ENTRIES {
+            fs::write(root.join(format!("file-{index}.txt")), b"data")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            scan_send_paths(vec![root.clone()], ScanCancellation::new()).await,
+            Err(SourceScanError::TooManyEntries)
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn rejects_duplicate_logical_paths() {
         let root = scan_root("duplicate");
         let first = root.join("first");
@@ -721,8 +741,7 @@ mod tests {
         permissions.set_mode(0o600);
         std_fs::set_permissions(&unreadable, permissions).unwrap();
 
-        let socket_path =
-            PathBuf::from("/tmp").join(format!("drift-storage-{}", TransferId::new()));
+        let socket_path = std::env::temp_dir().join(format!("d-{}", TransferId::new()));
         let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         assert_eq!(
             scan_send_paths(vec![socket_path.clone()], ScanCancellation::new()).await,
