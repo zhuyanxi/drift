@@ -1,7 +1,7 @@
 use crate::settings::{
     ConfigPathError, DriftSettings, SettingsError, SettingsLoader, SettingsSource,
 };
-use drift_core::TransferId;
+use drift_core::{TransferId, TransferManifest};
 use drift_protocol::{BackendError, CrocBackend, ReceiveRequest, SendRequest};
 use drift_storage::{validate_receive_directory, DestinationError, JsonStore};
 use drift_transfer::{TransferManager, TransferNotification};
@@ -176,6 +176,7 @@ impl AppHandle {
 pub enum AppCommand {
     Send {
         paths: Vec<PathBuf>,
+        manifest: TransferManifest,
     },
     Receive {
         code: String,
@@ -189,7 +190,7 @@ pub enum AppCommand {
 impl fmt::Debug for AppCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Send { paths } => formatter
+            Self::Send { paths, .. } => formatter
                 .debug_struct("Send")
                 .field("path_count", &paths.len())
                 .finish(),
@@ -258,10 +259,10 @@ async fn dispatch_command(
     command: AppCommand,
 ) -> Result<TransferId, AppCommandError> {
     match command {
-        AppCommand::Send { paths } => {
+        AppCommand::Send { paths, manifest } => {
             let request = SendRequest::new(paths).map_err(AppCommandError::InvalidRequest)?;
             transfer_manager
-                .start_send(request)
+                .start_send_with_manifest(request, Some(manifest))
                 .await
                 .map_err(AppCommandError::Transfer)
         }

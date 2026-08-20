@@ -1,11 +1,17 @@
-use drift_core::{Role, TransferCapability, TransferEvent, TransferId};
+use drift_core::{Role, TransferCapability, TransferEvent, TransferId, TransferManifest};
+use drift_storage::{scan_send_paths, ScanCancellation, SourceScan, SourceScanError};
 use drift_transfer::TransferNotification;
 use drift_ui::{
     ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture, ReceiveEventStream,
-    ReceiveFuture, SendCommandError, SendCommandErrorKind, SendController, SendEvent,
-    SendEventFuture, SendEventStream, SendFuture, SendProgress,
+    ReceiveFuture, SelectedItem, SendCommandError, SendCommandErrorKind, SendController, SendEvent,
+    SendEventFuture, SendEventStream, SendFuture, SendProgress, SendSelection,
 };
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::broadcast;
 
 use crate::{AppCommand, AppCommandError, AppHandle};
@@ -13,15 +19,42 @@ use crate::{AppCommand, AppCommandError, AppHandle};
 #[derive(Clone)]
 pub struct AppSendController {
     handle: AppHandle,
+    scan_cancellation: Arc<Mutex<Option<ScanCancellation>>>,
 }
 
 impl AppSendController {
     pub fn new(handle: AppHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            scan_cancellation: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
 impl SendController for AppSendController {
+    fn scan(&self, paths: Vec<PathBuf>) -> SendFuture<Result<SendSelection, SendCommandError>> {
+        let cancellation = ScanCancellation::new();
+        if let Ok(mut current) = self.scan_cancellation.lock() {
+            if let Some(previous) = current.replace(cancellation.clone()) {
+                previous.cancel();
+            }
+        }
+        Box::pin(async move {
+            scan_send_paths(paths, cancellation)
+                .await
+                .map_err(map_source_scan_error)
+                .and_then(source_scan_to_selection)
+        })
+    }
+
+    fn cancel_scan(&self) {
+        if let Ok(current) = self.scan_cancellation.lock() {
+            if let Some(cancellation) = current.as_ref() {
+                cancellation.cancel();
+            }
+        }
+    }
+
     fn preflight(&self, _paths: Vec<PathBuf>) -> SendFuture<Result<(), SendCommandError>> {
         let handle = self.handle.clone();
         Box::pin(async move {
@@ -34,10 +67,17 @@ impl SendController for AppSendController {
         })
     }
 
-    fn start_send(&self, paths: Vec<PathBuf>) -> SendFuture<Result<TransferId, SendCommandError>> {
+    fn start_send(
+        &self,
+        paths: Vec<PathBuf>,
+        manifest: Option<TransferManifest>,
+    ) -> SendFuture<Result<TransferId, SendCommandError>> {
         let handle = self.handle.clone();
         Box::pin(async move {
-            match handle.dispatch(AppCommand::Send { paths }).await {
+            let Some(manifest) = manifest else {
+                return Err(SendCommandError::new(SendCommandErrorKind::StartFailed));
+            };
+            match handle.dispatch(AppCommand::Send { paths, manifest }).await {
                 Ok(Ok(transfer_id)) => Ok(transfer_id),
                 Ok(Err(_)) | Err(_) => {
                     Err(SendCommandError::new(SendCommandErrorKind::StartFailed))
@@ -64,6 +104,34 @@ impl SendController for AppSendController {
             receiver: self.handle.subscribe(),
         })
     }
+}
+
+fn source_scan_to_selection(scan: SourceScan) -> Result<SendSelection, SendCommandError> {
+    let items = scan
+        .roots()
+        .iter()
+        .map(|root| SelectedItem::new(root.path().to_path_buf(), root.total_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SendCommandError::scan_failed())?;
+    SendSelection::with_manifest(items, scan.manifest().clone())
+        .map_err(|_| SendCommandError::scan_failed())
+}
+
+fn map_source_scan_error(error: SourceScanError) -> SendCommandError {
+    let kind = match error {
+        SourceScanError::Unavailable => SendCommandErrorKind::SourceUnavailable,
+        SourceScanError::Unreadable => SendCommandErrorKind::SourceUnreadable,
+        SourceScanError::SymlinkNotAllowed => SendCommandErrorKind::SymlinkNotAllowed,
+        SourceScanError::UnsupportedFileType => SendCommandErrorKind::UnsupportedFileType,
+        SourceScanError::EmptyDirectory => SendCommandErrorKind::EmptyDirectory,
+        SourceScanError::DuplicatePath => SendCommandErrorKind::DuplicatePath,
+        SourceScanError::InvalidRelativePath => SendCommandErrorKind::InvalidRelativePath,
+        SourceScanError::Cancelled => SendCommandErrorKind::ScanCancelled,
+        SourceScanError::EmptySelection
+        | SourceScanError::InvalidRoot
+        | SourceScanError::SizeOverflow => SendCommandErrorKind::ScanFailed,
+    };
+    SendCommandError::new(kind)
 }
 
 #[derive(Clone)]

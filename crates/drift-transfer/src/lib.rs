@@ -1,6 +1,6 @@
 use drift_core::{
-    Role, TransferCapability, TransferError, TransferEvent, TransferId, TransferSession,
-    TransferState,
+    Role, TransferCapability, TransferError, TransferEvent, TransferId, TransferManifest,
+    TransferSession, TransferState,
 };
 use drift_protocol::{
     BackendCapability, BackendError, BackendEvent, ReceiveRequest, SendRequest, TransferBackend,
@@ -64,7 +64,30 @@ where
     }
 
     pub async fn start_send(&self, request: SendRequest) -> Result<TransferId, TransferError> {
+        self.start_send_with_manifest(request, None).await
+    }
+
+    pub async fn start_send_with_manifest(
+        &self,
+        request: SendRequest,
+        manifest: Option<TransferManifest>,
+    ) -> Result<TransferId, TransferError> {
+        if let Some(manifest) = &manifest {
+            manifest
+                .validate()
+                .map_err(|_| TransferError::Backend("invalid sender manifest".into()))?;
+        }
         let transfer_id = self.create_session(Role::Sender).await;
+        if let Some(mut manifest) = manifest {
+            manifest.transfer_id = transfer_id;
+            let mut sessions = self.inner.sessions.write().await;
+            let Some(session) = sessions.get_mut(&transfer_id) else {
+                return Err(TransferError::Backend(
+                    "sender session disappeared before manifest setup".into(),
+                ));
+            };
+            session.set_manifest(manifest);
+        }
         self.advance(
             transfer_id,
             TransferState::Connecting,
@@ -356,19 +379,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drift_core::{StateTransitionError, TransferCapability};
+    use drift_core::{FileEntry, StateTransitionError, TransferCapability, TransferManifest};
     use drift_protocol::CrocBackend;
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_SCRIPT_ID: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(unix)]
     fn write_script(body: &str) -> PathBuf {
-        use std::{fs, os::unix::fs::PermissionsExt, time::SystemTime};
+        use std::{fs, os::unix::fs::PermissionsExt};
 
-        let suffix = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("drift-transfer-test-{suffix}"));
+        let suffix = NEXT_SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "drift-transfer-test-{}-{suffix}",
+            std::process::id()
+        ));
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o700);
@@ -468,6 +496,50 @@ mod tests {
         assert_eq!(session.state, TransferState::Completed);
         let debug = format!("{session:?}");
         assert!(!debug.contains("manager-code"));
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stores_validated_sender_manifest_on_the_transfer_session() {
+        let script = versioned_script("sleep 0.05; printf 'Code is: manifest-code\\n' >&2");
+        let manager = TransferManager::new(CrocBackend::new(&script));
+        let mut events = manager.subscribe();
+        let manifest = TransferManifest::new(
+            TransferId::new(),
+            vec![FileEntry::new("folder/file.txt", 4).unwrap()],
+        )
+        .unwrap();
+
+        let transfer_id = manager
+            .start_send_with_manifest(
+                SendRequest::new(vec![PathBuf::from("folder")]).unwrap(),
+                Some(manifest),
+            )
+            .await
+            .unwrap();
+        loop {
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if notification.transfer_id == transfer_id
+                && notification.event == TransferEvent::Completed
+            {
+                break;
+            }
+        }
+        let session = manager.session(transfer_id).await.unwrap();
+        let session_manifest = session.manifest.as_ref().unwrap();
+
+        assert_eq!(session_manifest.transfer_id, transfer_id);
+        assert_eq!(session_manifest.total_size, 4);
+        assert_eq!(
+            session_manifest.files[0].relative_path,
+            PathBuf::from("folder/file.txt")
+        );
+
         let _ = std::fs::remove_file(script);
     }
 

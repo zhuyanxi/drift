@@ -16,11 +16,12 @@ pub use send::{
 mod gui {
     use gpui::{
         actions, div, prelude::*, AnyElement, App, Application, AsyncApp, ClickEvent,
-        ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, KeyBinding, MouseButton,
-        MouseDownEvent, PathPromptOptions, Render, SharedString, Task, WeakEntity, Window,
-        WindowOptions,
+        ClipboardItem, Context, ExternalPaths, FocusHandle, IntoElement, KeyDownEvent, KeyBinding,
+        MouseButton, MouseDownEvent, PathPromptOptions, Render, SharedString, Task, WeakEntity,
+        Window, WindowOptions,
     };
     use std::sync::Arc;
+    use std::{future::Future, path::PathBuf, pin::Pin};
 
     use super::{
         ReceiveAction, ReceiveCommandError, ReceiveController, ReceiveEventStream, ReceiveIntent,
@@ -45,6 +46,27 @@ mod gui {
         }
     }
 
+    type PathPickerFuture =
+        Pin<Box<dyn Future<Output = Result<Option<Vec<PathBuf>>, ()>> + Send + 'static>>;
+
+    trait SendPathPicker: Send + Sync {
+        fn choose(&self, cx: &mut App) -> PathPickerFuture;
+    }
+
+    struct GpuiSendPathPicker;
+
+    impl SendPathPicker for GpuiSendPathPicker {
+        fn choose(&self, cx: &mut App) -> PathPickerFuture {
+            let picker = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: true,
+                multiple: true,
+                prompt: Some(SharedString::from("Choose files or folders")),
+            });
+            Box::pin(async move { picker.await.map_err(|_| ())?.map_err(|_| ()) })
+        }
+    }
+
     struct UnavailableSendController;
 
     impl SendController for UnavailableSendController {
@@ -58,6 +80,7 @@ mod gui {
         fn start_send(
             &self,
             _paths: Vec<std::path::PathBuf>,
+            _manifest: Option<drift_core::TransferManifest>,
         ) -> super::SendFuture<Result<drift_core::TransferId, SendCommandError>> {
             Box::pin(async { Err(SendCommandError::start_failed()) })
         }
@@ -138,6 +161,7 @@ mod gui {
         controller: Arc<dyn SendController>,
         receive_controller: Arc<dyn ReceiveController>,
         clipboard: Arc<dyn ClipboardService>,
+        path_picker: Arc<dyn SendPathPicker>,
         receive_focus: FocusHandle,
         _send_event_task: Task<()>,
         _receive_event_task: Task<()>,
@@ -227,6 +251,7 @@ mod gui {
                 controller,
                 receive_controller,
                 clipboard,
+                path_picker: Arc::new(GpuiSendPathPicker),
                 receive_focus: cx.focus_handle(),
                 _send_event_task: send_event_task,
                 _receive_event_task: receive_event_task,
@@ -245,10 +270,11 @@ mod gui {
         fn run_intent(&mut self, intent: SendIntent, cx: &mut Context<Self>) {
             match intent {
                 SendIntent::Choose => self.start_choose(cx),
+                SendIntent::CancelScan => self.controller.cancel_scan(),
                 SendIntent::Preflight { generation, paths } => {
                     self.start_preflight(generation, paths, cx)
                 }
-                SendIntent::Start { paths } => self.start_transfer(paths, cx),
+                SendIntent::Start { paths, manifest } => self.start_transfer(paths, manifest, cx),
                 SendIntent::CopyCode { code } => {
                     let result = self.clipboard.copy(&code, cx);
                     self.send.mark_copy_result(result);
@@ -487,42 +513,76 @@ mod gui {
         }
 
         fn start_choose(&mut self, cx: &mut Context<Self>) {
+            let picker = self.path_picker.choose(cx);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| match picker.await {
+                    Ok(Some(paths)) if !paths.is_empty() => {
+                        let _ = this.update(&mut *cx, |view, cx| {
+                            view.start_scan(paths, cx);
+                            cx.notify();
+                        });
+                    }
+                    Ok(Some(_)) => {
+                        let _ = this.update(&mut *cx, |view, cx| {
+                            view.send.cancel_choose();
+                            cx.notify();
+                        });
+                    }
+                    Ok(None) => {
+                        let _ = this.update(&mut *cx, |view, cx| {
+                            view.send.cancel_choose();
+                            cx.notify();
+                        });
+                    }
+                    Err(_) => {
+                        let _ = this.update(&mut *cx, |view, cx| {
+                            view.send.mark_choose_failed();
+                            cx.notify();
+                        });
+                    }
+                },
+            ));
+        }
+
+        fn start_scan(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+            self.controller.cancel_scan();
+            let Some(generation) = self.send.begin_scan() else {
+                return;
+            };
             let controller = Arc::clone(&self.controller);
             self.command_task = Some(cx.spawn(
                 async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
-                    match controller.choose().await {
-                        Ok(selection) => {
-                            let Some(SendIntent::Preflight { generation, paths }) = this
-                                .update(&mut *cx, |view, cx| {
-                                    let intent = view.send.set_selection(selection);
-                                    cx.notify();
-                                    intent
-                                })
-                                .ok()
-                            else {
-                                return;
-                            };
-                            match controller.preflight(paths).await {
-                                Ok(()) => {
-                                    let _ = this.update(&mut *cx, |view, cx| {
-                                        view.send.mark_preflight_succeeded(generation);
-                                        cx.notify();
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = this.update(&mut *cx, |view, cx| {
-                                        view.send.mark_preflight_failed(generation);
-                                        cx.notify();
-                                    });
-                                }
-                            }
-                        }
-                        Err(_) => {
+                    let selection = match controller.scan(paths).await {
+                        Ok(selection) => selection,
+                        Err(error) => {
                             let _ = this.update(&mut *cx, |view, cx| {
-                                view.send.mark_choose_failed();
+                                view.send.mark_scan_failed(generation, error);
                                 cx.notify();
                             });
+                            return;
                         }
+                    };
+                    let Some(SendIntent::Preflight { generation, paths }) = this
+                        .update(&mut *cx, |view, cx| {
+                            let intent = view.send.apply_scan_result(generation, selection);
+                            cx.notify();
+                            intent
+                        })
+                        .ok()
+                        .flatten()
+                    else {
+                        return;
+                    };
+                    if controller.preflight(paths).await.is_ok() {
+                        let _ = this.update(&mut *cx, |view, cx| {
+                            view.send.mark_preflight_succeeded(generation);
+                            cx.notify();
+                        });
+                    } else {
+                        let _ = this.update(&mut *cx, |view, cx| {
+                            view.send.mark_preflight_failed(generation);
+                            cx.notify();
+                        });
                     }
                 },
             ));
@@ -550,11 +610,16 @@ mod gui {
             ));
         }
 
-        fn start_transfer(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        fn start_transfer(
+            &mut self,
+            paths: Vec<std::path::PathBuf>,
+            manifest: Option<drift_core::TransferManifest>,
+            cx: &mut Context<Self>,
+        ) {
             let controller = Arc::clone(&self.controller);
             self.command_task = Some(cx.spawn(
                 async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
-                    match controller.start_send(paths).await {
+                    match controller.start_send(paths, manifest).await {
                         Ok(transfer_id) => {
                             let _ = this.update(&mut *cx, |view, cx| {
                                 view.send.mark_start_succeeded(transfer_id);
@@ -601,8 +666,8 @@ mod gui {
             let selection = self.send.selection();
             let summary = selection.map(|selection| {
                 format!(
-                    "{} item(s) / {}",
-                    selection.item_count(),
+                    "{} file(s) / {}",
+                    selection.file_count(),
                     format_bytes(selection.total_bytes())
                 )
             });
@@ -625,6 +690,7 @@ mod gui {
                             .justify_between()
                             .gap_2()
                             .child(label)
+                            .child(format_bytes(item.bytes()))
                             .child(action_button(
                                 SharedString::from(format!("send-remove-{index}")),
                                 "Remove",
@@ -646,6 +712,9 @@ mod gui {
             });
             let cancel = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
                 view.dispatch_action(SendAction::Cancel, cx);
+            });
+            let clear = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.dispatch_action(SendAction::ClearSelection, cx);
             });
 
             let mut code_panel = div().flex().items_center().gap_2();
@@ -693,6 +762,11 @@ mod gui {
                         .flex()
                         .flex_col()
                         .gap_2()
+                        .on_drop(cx.listener(
+                            |view: &mut MainView, paths: &ExternalPaths, _, cx| {
+                                view.start_scan(paths.paths().to_vec(), cx);
+                            },
+                        ))
                         .bg(gpui::rgb(0xffffff))
                         .border_1()
                         .border_color(gpui::rgb(0xd7d0c4))
@@ -703,7 +777,13 @@ mod gui {
                         .when(summary.is_some(), |this| {
                             this.child(summary.clone().unwrap_or_default())
                                 .child(selection_list)
-                        }),
+                        })
+                        .child(action_button(
+                            "send-clear-selection",
+                            "Clear all",
+                            self.send.clear_enabled(),
+                            clear,
+                        )),
                 )
                 .child(code_panel)
                 .child(
@@ -713,7 +793,7 @@ mod gui {
                         .gap_2()
                         .child(action_button(
                             "send-choose",
-                            "Choose files",
+                            "Choose files or folders",
                             self.send.choose_enabled(),
                             choose,
                         ))

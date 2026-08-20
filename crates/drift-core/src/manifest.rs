@@ -22,6 +22,8 @@ pub enum ManifestError {
     NulByte,
     #[error("file size total overflow")]
     SizeOverflow,
+    #[error("manifest contains duplicate or conflicting file paths")]
+    DuplicatePath,
     #[error("chunk size must be greater than zero")]
     InvalidChunkSize,
 }
@@ -118,8 +120,22 @@ impl TransferManifest {
         if self.files.is_empty() {
             return Err(ManifestError::Empty);
         }
+        let mut paths = self
+            .files
+            .iter()
+            .map(|file| {
+                sanitize_relative_path(&file.relative_path)?;
+                Ok(file.relative_path.clone())
+            })
+            .collect::<Result<Vec<_>, ManifestError>>()?;
+        paths.sort();
+        if paths
+            .windows(2)
+            .any(|window| window[0] == window[1] || window[1].starts_with(&window[0]))
+        {
+            return Err(ManifestError::DuplicatePath);
+        }
         let computed_total = self.files.iter().try_fold(0_u64, |total, file| {
-            sanitize_relative_path(&file.relative_path)?;
             total
                 .checked_add(file.size)
                 .ok_or(ManifestError::SizeOverflow)
@@ -303,6 +319,29 @@ mod tests {
         let manifest = TransferManifest::new(transfer_id, files).unwrap();
         assert_eq!(manifest.total_size, 5);
         assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_duplicate_and_file_directory_conflicts() {
+        let duplicate = TransferManifest {
+            transfer_id: TransferId::new(),
+            files: vec![
+                FileEntry::new("folder/file.txt", 1).unwrap(),
+                FileEntry::new("folder/file.txt", 1).unwrap(),
+            ],
+            total_size: 2,
+        };
+        assert_eq!(duplicate.validate(), Err(ManifestError::DuplicatePath));
+
+        let conflict = TransferManifest {
+            transfer_id: TransferId::new(),
+            files: vec![
+                FileEntry::new("folder", 1).unwrap(),
+                FileEntry::new("folder/file.txt", 1).unwrap(),
+            ],
+            total_size: 2,
+        };
+        assert_eq!(conflict.validate(), Err(ManifestError::DuplicatePath));
     }
 
     #[test]
