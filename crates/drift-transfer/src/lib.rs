@@ -6,7 +6,7 @@ use drift_protocol::{
     BackendCapability, BackendError, BackendEvent, ReceiveRequest, SendRequest, TransferBackend,
     TransferHandle,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tracing::{debug, warn};
 
@@ -133,16 +133,41 @@ where
     }
 
     pub async fn retry(&self, transfer_id: TransferId) -> Result<TransferId, TransferError> {
+        self.retry_with_receive_validation(transfer_id, |_output_directory| async { Ok(()) })
+            .await
+    }
+
+    pub async fn retry_with_receive_validation<F, Fut, E>(
+        &self,
+        transfer_id: TransferId,
+        validate_receive: F,
+    ) -> Result<TransferId, E>
+    where
+        E: From<TransferError> + Send,
+        F: FnOnce(PathBuf) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+    {
         let session = self
             .session(transfer_id)
             .await
-            .ok_or_else(|| TransferError::Backend("transfer session not found".into()))?;
+            .ok_or_else(|| E::from(TransferError::Backend("transfer session not found".into())))?;
         if session.state != TransferState::Failed
             || !session
                 .failure_kind
                 .is_some_and(TransferFailureKind::is_retryable)
         {
-            return Err(TransferError::RetryNotAllowed(session.state));
+            return Err(E::from(TransferError::RetryNotAllowed(session.state)));
+        }
+        let request = self
+            .inner
+            .retry_requests
+            .lock()
+            .await
+            .get(&transfer_id)
+            .cloned()
+            .ok_or_else(|| E::from(TransferError::RetryNotAllowed(session.state)))?;
+        if let RetryRequest::Receive { request } = request {
+            validate_receive(request.output_directory).await?;
         }
         let request = self
             .inner
@@ -150,12 +175,15 @@ where
             .lock()
             .await
             .remove(&transfer_id)
-            .ok_or(TransferError::RetryNotAllowed(session.state))?;
+            .ok_or_else(|| E::from(TransferError::RetryNotAllowed(session.state)))?;
         match request {
-            RetryRequest::Send { request, manifest } => {
-                self.start_send_attempt(request, manifest).await
+            RetryRequest::Send { request, manifest } => self
+                .start_send_attempt(request, manifest)
+                .await
+                .map_err(E::from),
+            RetryRequest::Receive { request } => {
+                self.start_receive_attempt(request).await.map_err(E::from)
             }
-            RetryRequest::Receive { request } => self.start_receive_attempt(request).await,
         }
     }
 

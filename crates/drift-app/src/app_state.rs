@@ -258,6 +258,12 @@ impl AppCommandError {
     }
 }
 
+impl From<drift_core::TransferError> for AppCommandError {
+    fn from(error: drift_core::TransferError) -> Self {
+        Self::Transfer(error)
+    }
+}
+
 impl From<DestinationError> for AppCommandError {
     fn from(error: DestinationError) -> Self {
         match error {
@@ -306,10 +312,15 @@ async fn dispatch_command(
             .await
             .map(|()| transfer_id)
             .map_err(AppCommandError::Transfer),
-        AppCommand::RetryTransfer { transfer_id } => transfer_manager
-            .retry(transfer_id)
-            .await
-            .map_err(AppCommandError::Transfer),
+        AppCommand::RetryTransfer { transfer_id } => {
+            transfer_manager
+                .retry_with_receive_validation(transfer_id, |output_directory| async move {
+                    validate_receive_directory(&output_directory)
+                        .await
+                        .map_err(AppCommandError::from)
+                })
+                .await
+        }
     }
 }
 
@@ -326,6 +337,18 @@ mod tests {
     use super::*;
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    fn write_script(body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!("drift-app-test-{}", Uuid::new_v4()));
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
 
     fn temp_path() -> PathBuf {
         std::env::temp_dir().join(format!("drift-app-state-{}", Uuid::new_v4()))
@@ -411,5 +434,61 @@ mod tests {
             Err(AppCommandError::OutputDirectoryUnavailable)
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receive_retry_revalidates_destination_before_starting_new_attempt() {
+        let root = temp_path();
+        let receive_directory = root.join("received");
+        fs::create_dir_all(&receive_directory).unwrap();
+        let script = write_script(
+            "if [ \"$1\" = \"--version\" ]; then printf 'v11.2.2-build\\n'; exit 0; fi\nsleep 1",
+        );
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let manager = TransferManager::new(
+            CrocBackend::new(&script).with_timeout(std::time::Duration::from_millis(50)),
+        );
+        let mut events = manager.subscribe();
+
+        let result = runtime.block_on(async {
+            let transfer_id = dispatch_command(
+                manager.clone(),
+                receive_directory.clone(),
+                AppCommand::Receive {
+                    code: "transfer-code".into(),
+                    output_directory: Some(receive_directory.clone()),
+                },
+            )
+            .await
+            .unwrap();
+            loop {
+                let notification =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if notification.transfer_id == transfer_id
+                    && notification.event == drift_core::TransferEvent::Failed
+                {
+                    break transfer_id;
+                }
+            }
+        });
+        fs::remove_dir_all(&root).unwrap();
+
+        let retry_result = runtime.block_on(dispatch_command(
+            manager,
+            root.clone(),
+            AppCommand::RetryTransfer {
+                transfer_id: result,
+            },
+        ));
+        assert!(matches!(
+            retry_result,
+            Err(AppCommandError::OutputDirectoryUnavailable)
+        ));
+
+        let _ = fs::remove_file(script);
     }
 }

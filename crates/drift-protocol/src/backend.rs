@@ -253,4 +253,36 @@ mod tests {
     fn receive_request_rejects_empty_destination() {
         assert!(ReceiveRequest::new("secret-code", PathBuf::new()).is_err());
     }
+
+    #[test]
+    fn classifies_backend_failures_for_retry_policy() {
+        assert_eq!(
+            BackendError::Timeout {
+                timeout: Duration::from_secs(1),
+            }
+            .failure_kind(),
+            TransferFailureKind::Network
+        );
+        assert_eq!(
+            BackendError::Io(io::Error::other("interrupted")).failure_kind(),
+            TransferFailureKind::ProcessInterruption
+        );
+        assert_eq!(
+            BackendError::ProcessFailed {
+                code: Some(1),
+                stderr: String::new(),
+            }
+            .failure_kind(),
+            TransferFailureKind::ProcessFailure
+        );
+        assert_eq!(
+            BackendError::InvalidRequest("bad request".into()).failure_kind(),
+            TransferFailureKind::InvalidRequest
+        );
+        assert!(
+            TransferFailureKind::Network.is_retryable()
+                && TransferFailureKind::ProcessInterruption.is_retryable()
+        );
+        assert!(!TransferFailureKind::ProcessFailure.is_retryable());
+    }
 }
