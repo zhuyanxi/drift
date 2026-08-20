@@ -1,6 +1,7 @@
+use crate::event_bridge::AppTransferUpdate;
+use crate::{AppCommand, AppCommandError, AppHandle};
 use drift_core::{Role, TransferCapability, TransferEvent, TransferId, TransferManifest};
 use drift_storage::{scan_send_paths, ScanCancellation, SourceScan, SourceScanError};
-use drift_transfer::TransferNotification;
 use drift_ui::{
     ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture, ReceiveEventStream,
     ReceiveFuture, SelectedItem, SendCommandError, SendCommandErrorKind, SendController, SendEvent,
@@ -13,8 +14,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
-
-use crate::{AppCommand, AppCommandError, AppHandle};
 
 #[derive(Clone)]
 pub struct AppSendController {
@@ -227,24 +226,27 @@ fn map_destination_error(error: &AppCommandError) -> ReceiveCommandError {
 
 struct AppSendEventStream {
     handle: AppHandle,
-    receiver: broadcast::Receiver<TransferNotification>,
+    receiver: broadcast::Receiver<AppTransferUpdate>,
 }
 
 struct AppReceiveEventStream {
     handle: AppHandle,
-    receiver: broadcast::Receiver<TransferNotification>,
+    receiver: broadcast::Receiver<AppTransferUpdate>,
 }
 
 impl SendEventStream for AppSendEventStream {
     fn next(&mut self) -> SendEventFuture<'_> {
         Box::pin(async move {
             loop {
-                let notification = match self.receiver.recv().await {
-                    Ok(notification) => notification,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                let update = match self.receiver.recv().await {
+                    Ok(update) => update,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "send UI event stream lagged");
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return None,
                 };
-                if let Some(event) = map_notification(&self.handle, notification).await {
+                if let Some(event) = map_notification(&self.handle, update).await {
                     return Some(event);
                 }
             }
@@ -256,12 +258,15 @@ impl ReceiveEventStream for AppReceiveEventStream {
     fn next(&mut self) -> ReceiveEventFuture<'_> {
         Box::pin(async move {
             loop {
-                let notification = match self.receiver.recv().await {
-                    Ok(notification) => notification,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                let update = match self.receiver.recv().await {
+                    Ok(update) => update,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "receive UI event stream lagged");
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return None,
                 };
-                if let Some(event) = map_receive_notification(&self.handle, notification).await {
+                if let Some(event) = map_receive_notification(&self.handle, update).await {
                     return Some(event);
                 }
             }
@@ -271,22 +276,27 @@ impl ReceiveEventStream for AppReceiveEventStream {
 
 fn map_notification(
     handle: &AppHandle,
-    notification: TransferNotification,
+    update: AppTransferUpdate,
 ) -> impl Future<Output = Option<SendEvent>> + Send + '_ {
     async move {
-        let transfer_id = notification.transfer_id;
-        let session = handle.session(transfer_id).await?;
-        if session.role != Role::Sender {
+        let AppTransferUpdate {
+            transfer_id,
+            event,
+            presentation,
+        } = update;
+        if presentation.role != Role::Sender {
             return None;
         }
-        Some(match notification.event {
+        Some(match event {
             TransferEvent::Created => SendEvent::Created { transfer_id },
             TransferEvent::Connecting => SendEvent::Connecting { transfer_id },
+            TransferEvent::Connected => SendEvent::Connected { transfer_id },
             TransferEvent::Authenticating => SendEvent::Authenticating { transfer_id },
+            TransferEvent::Negotiating => SendEvent::Negotiating { transfer_id },
             TransferEvent::Started => SendEvent::Started { transfer_id },
             TransferEvent::CodeAvailable => SendEvent::CodeAvailable {
                 transfer_id,
-                code: session.code?,
+                code: handle.session(transfer_id).await?.code?,
             },
             TransferEvent::Progress {
                 transferred,
@@ -312,33 +322,37 @@ fn map_notification(
             TransferEvent::Completed => SendEvent::Completed { transfer_id },
             TransferEvent::Failed => SendEvent::Failed {
                 transfer_id,
-                message: session
+                message: presentation
                     .error
                     .unwrap_or_else(|| "The transfer failed.".to_owned()),
             },
             TransferEvent::Cancelled => SendEvent::Cancelled { transfer_id },
-            TransferEvent::Connected
-            | TransferEvent::MetadataReady
-            | TransferEvent::Paused
-            | TransferEvent::Resumed => return None,
+            TransferEvent::MetadataReady | TransferEvent::Paused | TransferEvent::Resumed => {
+                return None
+            }
         })
     }
 }
 
 fn map_receive_notification(
-    handle: &AppHandle,
-    notification: TransferNotification,
+    _handle: &AppHandle,
+    update: AppTransferUpdate,
 ) -> impl Future<Output = Option<ReceiveEvent>> + Send + '_ {
     async move {
-        let transfer_id = notification.transfer_id;
-        let session = handle.session(transfer_id).await?;
-        if session.role != Role::Receiver {
+        let AppTransferUpdate {
+            transfer_id,
+            event,
+            presentation,
+        } = update;
+        if presentation.role != Role::Receiver {
             return None;
         }
-        Some(match notification.event {
+        Some(match event {
             TransferEvent::Created => ReceiveEvent::Created { transfer_id },
             TransferEvent::Connecting => ReceiveEvent::Connecting { transfer_id },
+            TransferEvent::Connected => ReceiveEvent::Connected { transfer_id },
             TransferEvent::Authenticating => ReceiveEvent::Authenticating { transfer_id },
+            TransferEvent::Negotiating => ReceiveEvent::Negotiating { transfer_id },
             TransferEvent::Started => ReceiveEvent::Started { transfer_id },
             TransferEvent::Progress {
                 transferred,
@@ -362,13 +376,12 @@ fn map_receive_notification(
             TransferEvent::Completed => ReceiveEvent::Completed { transfer_id },
             TransferEvent::Failed => ReceiveEvent::Failed {
                 transfer_id,
-                message: session
+                message: presentation
                     .error
                     .unwrap_or_else(|| "The receive transfer failed.".to_owned()),
             },
             TransferEvent::Cancelled => ReceiveEvent::Cancelled { transfer_id },
-            TransferEvent::Connected
-            | TransferEvent::CodeAvailable
+            TransferEvent::CodeAvailable
             | TransferEvent::MetadataReady
             | TransferEvent::Paused
             | TransferEvent::Resumed => return None,

@@ -1,4 +1,5 @@
-use drift_core::{TransferCapability, TransferId, TransferManifest};
+use crate::progress::{accept_progress, eta_seconds};
+use drift_core::{Progress, TransferCapability, TransferId, TransferManifest};
 use std::{fmt, future::Future, path::PathBuf, pin::Pin};
 
 pub type SendFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -204,6 +205,12 @@ pub struct SendProgress {
     pub speed_bps: u64,
 }
 
+impl SendProgress {
+    pub fn eta_seconds(self) -> Option<u64> {
+        eta_seconds(self.transferred, self.total, self.speed_bps)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPhase {
     Empty,
@@ -213,7 +220,9 @@ pub enum SendPhase {
     Ready,
     Starting,
     Connecting,
+    Connected,
     Authenticating,
+    Negotiating,
     Transferring,
     CodeReady,
     Verifying,
@@ -233,7 +242,9 @@ impl SendPhase {
             Self::Ready => "Ready to send",
             Self::Starting => "Starting transfer",
             Self::Connecting => "Connecting",
+            Self::Connected => "Connected",
             Self::Authenticating => "Authenticating",
+            Self::Negotiating => "Negotiating",
             Self::Transferring => "Transferring",
             Self::CodeReady => "Code ready",
             Self::Verifying => "Verifying",
@@ -331,7 +342,13 @@ pub enum SendEvent {
     Connecting {
         transfer_id: TransferId,
     },
+    Connected {
+        transfer_id: TransferId,
+    },
     Authenticating {
+        transfer_id: TransferId,
+    },
+    Negotiating {
         transfer_id: TransferId,
     },
     Started {
@@ -388,8 +405,16 @@ impl fmt::Debug for SendEvent {
                 .debug_struct("Connecting")
                 .field("transfer_id", transfer_id)
                 .finish(),
+            Self::Connected { transfer_id } => formatter
+                .debug_struct("Connected")
+                .field("transfer_id", transfer_id)
+                .finish(),
             Self::Authenticating { transfer_id } => formatter
                 .debug_struct("Authenticating")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::Negotiating { transfer_id } => formatter
+                .debug_struct("Negotiating")
                 .field("transfer_id", transfer_id)
                 .finish(),
             Self::Started { transfer_id } => formatter
@@ -574,6 +599,22 @@ impl SendViewState {
         self.progress
     }
 
+    pub fn progress_speed_bps(&self) -> Option<u64> {
+        if !self.progress_available || !self.progress_is_active() {
+            return None;
+        }
+        self.progress
+            .filter(|progress| progress.speed_bps > 0)
+            .map(|progress| progress.speed_bps)
+    }
+
+    pub fn progress_eta_seconds(&self) -> Option<u64> {
+        if !self.progress_available || !self.progress_is_active() {
+            return None;
+        }
+        self.progress.and_then(SendProgress::eta_seconds)
+    }
+
     pub fn progress_available(&self) -> bool {
         self.progress_available
     }
@@ -618,7 +659,9 @@ impl SendViewState {
                 self.phase,
                 SendPhase::Starting
                     | SendPhase::Connecting
+                    | SendPhase::Connected
                     | SendPhase::Authenticating
+                    | SendPhase::Negotiating
                     | SendPhase::Transferring
                     | SendPhase::CodeReady
                     | SendPhase::Verifying
@@ -732,6 +775,8 @@ impl SendViewState {
             SendAction::Start if self.start_enabled() => {
                 if self.phase == SendPhase::Failed {
                     self.phase = SendPhase::Preflighting;
+                    self.progress = None;
+                    self.progress_available = true;
                     self.error = None;
                     return Some(self.preflight_intent());
                 }
@@ -740,6 +785,8 @@ impl SendViewState {
                     .as_ref()
                     .map(|selection| selection.clone().into_paths())?;
                 self.phase = SendPhase::Starting;
+                self.progress = None;
+                self.progress_available = true;
                 self.error = None;
                 let manifest = self
                     .selection
@@ -838,6 +885,8 @@ impl SendViewState {
             SendEvent::Created { transfer_id } => {
                 if self.phase == SendPhase::Starting && self.active_transfer_id.is_none() {
                     self.active_transfer_id = Some(transfer_id);
+                    self.progress = None;
+                    self.progress_available = true;
                 }
             }
             SendEvent::Connecting { transfer_id } => {
@@ -845,9 +894,19 @@ impl SendViewState {
                     self.phase = SendPhase::Connecting;
                 }
             }
+            SendEvent::Connected { transfer_id } => {
+                if self.accepts_transfer(transfer_id) {
+                    self.phase = SendPhase::Connected;
+                }
+            }
             SendEvent::Authenticating { transfer_id } => {
                 if self.accepts_transfer(transfer_id) {
                     self.phase = SendPhase::Authenticating;
+                }
+            }
+            SendEvent::Negotiating { transfer_id } => {
+                if self.accepts_transfer(transfer_id) {
+                    self.phase = SendPhase::Negotiating;
                 }
             }
             SendEvent::Started { transfer_id } => {
@@ -858,7 +917,9 @@ impl SendViewState {
             SendEvent::CodeAvailable { transfer_id, code } => {
                 if self.accepts_transfer(transfer_id) {
                     self.code = Some(code);
-                    self.phase = SendPhase::CodeReady;
+                    if self.phase != SendPhase::Transferring {
+                        self.phase = SendPhase::CodeReady;
+                    }
                     self.copy_feedback = None;
                 }
             }
@@ -866,13 +927,31 @@ impl SendViewState {
                 transfer_id,
                 progress,
             } => {
-                if self.accepts_transfer(transfer_id) {
-                    self.progress = Some(progress);
-                    self.phase = if self.code.is_some() {
-                        SendPhase::CodeReady
-                    } else {
-                        SendPhase::Transferring
+                if self.accepts_transfer(transfer_id)
+                    && matches!(self.phase, SendPhase::Transferring | SendPhase::CodeReady)
+                {
+                    let previous = self.progress.map(|current| {
+                        Progress {
+                            transferred_bytes: current.transferred,
+                            total_bytes: current.total,
+                            speed_bps: current.speed_bps,
+                        }
+                    });
+                    let Some(progress) = accept_progress(
+                        previous,
+                        progress.transferred,
+                        progress.total,
+                        progress.speed_bps,
+                    ) else {
+                        return;
                     };
+                    let progress = SendProgress {
+                        transferred: progress.transferred_bytes,
+                        total: progress.total_bytes,
+                        speed_bps: progress.speed_bps,
+                    };
+                    self.progress = Some(progress);
+                    self.phase = SendPhase::Transferring;
                 }
             }
             SendEvent::CapabilityUnavailable {
@@ -929,6 +1008,10 @@ impl SendViewState {
 
     fn accepts_transfer(&self, transfer_id: TransferId) -> bool {
         self.active_transfer_id == Some(transfer_id)
+    }
+
+    fn progress_is_active(&self) -> bool {
+        matches!(self.phase, SendPhase::Transferring | SendPhase::CodeReady)
     }
 }
 
@@ -1065,14 +1148,16 @@ mod tests {
         let transfer_id = TransferId::new();
         state.apply_event(SendEvent::Created { transfer_id });
         state.apply_event(SendEvent::Connecting { transfer_id });
+        state.apply_event(SendEvent::Connected { transfer_id });
         state.apply_event(SendEvent::Authenticating { transfer_id });
+        state.apply_event(SendEvent::Negotiating { transfer_id });
         state.apply_event(SendEvent::Started { transfer_id });
         state.apply_event(SendEvent::CodeAvailable {
             transfer_id,
             code: "secret-code".into(),
         });
 
-        assert_eq!(state.phase(), SendPhase::CodeReady);
+        assert_eq!(state.phase(), SendPhase::Transferring);
         assert_eq!(state.transfer_code(), Some("secret-code"));
         assert_eq!(
             format!("{state:?}").contains("secret-code"),
@@ -1094,6 +1179,55 @@ mod tests {
         assert_eq!(state.phase(), SendPhase::Completed);
         assert_eq!(state.transfer_code(), None);
         assert_eq!(state.active_transfer_id(), None);
+    }
+
+    #[test]
+    fn sender_progress_is_monotonic_and_eta_is_hidden_during_verification() {
+        let mut state = SendViewState::new();
+        let generation = match state.set_selection(selection()) {
+            SendIntent::Preflight { generation, .. } => generation,
+            other => panic!("unexpected intent: {other:?}"),
+        };
+        state.mark_preflight_succeeded(generation);
+        state.handle_action(SendAction::Start);
+        let transfer_id = TransferId::new();
+        state.apply_event(SendEvent::Created { transfer_id });
+        state.apply_event(SendEvent::Started { transfer_id });
+        state.apply_event(SendEvent::Progress {
+            transfer_id,
+            progress: SendProgress {
+                transferred: 25,
+                total: 100,
+                speed_bps: 25,
+            },
+        });
+
+        assert_eq!(state.progress_speed_bps(), Some(25));
+        assert_eq!(state.progress_eta_seconds(), Some(3));
+
+        state.apply_event(SendEvent::Progress {
+            transfer_id,
+            progress: SendProgress {
+                transferred: 10,
+                total: 100,
+                speed_bps: 10,
+            },
+        });
+        assert_eq!(state.progress().map(|progress| progress.transferred), Some(25));
+
+        state.apply_event(SendEvent::Verifying { transfer_id });
+        assert_eq!(state.progress_eta_seconds(), None);
+        assert_eq!(state.progress_speed_bps(), None);
+        state.apply_event(SendEvent::Progress {
+            transfer_id,
+            progress: SendProgress {
+                transferred: 50,
+                total: 100,
+                speed_bps: 25,
+            },
+        });
+        assert_eq!(state.phase(), SendPhase::Verifying);
+        assert_eq!(state.progress().map(|progress| progress.transferred), Some(25));
     }
 
     #[test]

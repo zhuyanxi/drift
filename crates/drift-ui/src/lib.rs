@@ -1,5 +1,6 @@
 mod send;
 mod receive;
+mod progress;
 
 pub use receive::{
     ReceiveAction, ReceiveCommandError, ReceiveCommandErrorKind, ReceiveController, ReceiveEvent,
@@ -817,10 +818,11 @@ mod gui {
 
             if let Some(progress) = self.send.progress() {
                 let progress_label = if self.send.progress_available() {
-                    format!(
-                        "{} / {}",
-                        format_bytes(progress.transferred),
-                        format_bytes(progress.total)
+                    format_progress(
+                        progress.transferred,
+                        progress.total,
+                        self.send.progress_speed_bps(),
+                        self.send.progress_eta_seconds(),
                     )
                 } else {
                     "Progress unavailable".to_owned()
@@ -973,10 +975,11 @@ mod gui {
 
             if let Some(progress) = self.receive.progress() {
                 let progress_label = if self.receive.progress_available() {
-                    format!(
-                        "{} / {}",
-                        format_bytes(progress.0),
-                        format_bytes(progress.1)
+                    format_progress(
+                        progress.0,
+                        progress.1,
+                        self.receive.progress_speed_bps(),
+                        self.receive.progress_eta_seconds(),
                     )
                 } else {
                     "Progress unavailable".to_owned()
@@ -1075,6 +1078,43 @@ mod gui {
             format!("{:.1} KiB", bytes as f64 / KIB as f64)
         } else {
             format!("{bytes} B")
+        }
+    }
+
+    fn format_progress(
+        transferred: u64,
+        total: u64,
+        speed_bps: Option<u64>,
+        eta_seconds: Option<u64>,
+    ) -> String {
+        let total = if total == 0 {
+            "total unavailable".to_owned()
+        } else {
+            format_bytes(total)
+        };
+        let speed = speed_bps.map_or_else(
+            || "speed unavailable".to_owned(),
+            |speed_bps| format!("{}/s", format_bytes(speed_bps)),
+        );
+        let eta = eta_seconds.map_or_else(
+            || "ETA unavailable".to_owned(),
+            format_eta,
+        );
+        format!("{} / {} | {} | ETA {eta}", format_bytes(transferred), total, speed)
+    }
+
+    fn format_eta(seconds: u64) -> String {
+        const MINUTE: u64 = 60;
+        const HOUR: u64 = MINUTE * 60;
+        const DAY: u64 = HOUR * 24;
+        if seconds >= DAY {
+            format!("{}d {}h", seconds / DAY, (seconds % DAY) / HOUR)
+        } else if seconds >= HOUR {
+            format!("{}h {}m", seconds / HOUR, (seconds % HOUR) / MINUTE)
+        } else if seconds >= MINUTE {
+            format!("{}m {}s", seconds / MINUTE, seconds % MINUTE)
+        } else {
+            format!("{seconds}s")
         }
     }
 

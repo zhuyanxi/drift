@@ -1,10 +1,11 @@
+use crate::event_bridge::{AppEventBridge, AppTransferUpdate, TransferPresentation};
 use crate::settings::{
     ConfigPathError, DriftSettings, SettingsError, SettingsLoader, SettingsSource,
 };
 use drift_core::{TransferId, TransferManifest};
 use drift_protocol::{BackendError, CrocBackend, ReceiveRequest, SendRequest};
 use drift_storage::{validate_receive_directory, DestinationError, JsonStore};
-use drift_transfer::{TransferManager, TransferNotification};
+use drift_transfer::TransferManager;
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -44,6 +45,7 @@ pub struct AppState {
     config_path: PathBuf,
     backend: CrocBackend,
     transfer_manager: TransferManager<CrocBackend>,
+    event_bridge: AppEventBridge,
     resume_store: JsonStore,
     runtime: Runtime,
 }
@@ -91,6 +93,7 @@ impl AppState {
             runtime: self.runtime.handle().clone(),
             backend: self.backend.clone(),
             transfer_manager: self.transfer_manager.clone(),
+            event_bridge: self.event_bridge.clone(),
             default_receive_directory: self.settings.transfer.default_receive_directory.clone(),
         }
     }
@@ -107,6 +110,7 @@ impl AppState {
             backend = backend.with_relay(relay);
         }
         let transfer_manager = TransferManager::with_backend_name(backend.clone(), "croc");
+        let event_bridge = AppEventBridge::start(runtime.handle(), transfer_manager.clone());
         let resume_store = JsonStore::new(resume_root(loader.path()));
 
         Ok(Self {
@@ -115,6 +119,7 @@ impl AppState {
             config_path: loader.path().to_path_buf(),
             backend,
             transfer_manager,
+            event_bridge,
             resume_store,
             runtime,
         })
@@ -126,6 +131,7 @@ pub struct AppHandle {
     runtime: Handle,
     backend: CrocBackend,
     transfer_manager: TransferManager<CrocBackend>,
+    event_bridge: AppEventBridge,
     default_receive_directory: PathBuf,
 }
 
@@ -164,12 +170,16 @@ impl AppHandle {
         })
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<TransferNotification> {
-        self.transfer_manager.subscribe()
+    pub fn subscribe(&self) -> broadcast::Receiver<AppTransferUpdate> {
+        self.event_bridge.subscribe()
     }
 
     pub async fn session(&self, transfer_id: TransferId) -> Option<drift_core::TransferSession> {
         self.transfer_manager.session(transfer_id).await
+    }
+
+    pub async fn presentation(&self, transfer_id: TransferId) -> Option<TransferPresentation> {
+        self.event_bridge.presentation(transfer_id).await
     }
 }
 

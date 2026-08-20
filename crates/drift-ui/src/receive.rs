@@ -1,4 +1,5 @@
-use drift_core::{TransferCapability, TransferId};
+use crate::progress::{accept_progress, eta_seconds};
+use drift_core::{Progress, TransferCapability, TransferId};
 use std::{fmt, future::Future, path::PathBuf, pin::Pin};
 
 pub type ReceiveFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -134,7 +135,9 @@ pub enum ReceivePhase {
     Ready,
     Starting,
     Connecting,
+    Connected,
     Authenticating,
+    Negotiating,
     Transferring,
     Verifying,
     Cancelling,
@@ -153,7 +156,9 @@ impl ReceivePhase {
             Self::Ready => "Ready to receive",
             Self::Starting => "Starting receive",
             Self::Connecting => "Connecting",
+            Self::Connected => "Connected",
             Self::Authenticating => "Authenticating",
+            Self::Negotiating => "Negotiating",
             Self::Transferring => "Receiving",
             Self::Verifying => "Verifying",
             Self::Cancelling => "Cancelling",
@@ -241,7 +246,13 @@ pub enum ReceiveEvent {
     Connecting {
         transfer_id: TransferId,
     },
+    Connected {
+        transfer_id: TransferId,
+    },
     Authenticating {
+        transfer_id: TransferId,
+    },
+    Negotiating {
         transfer_id: TransferId,
     },
     Started {
@@ -311,8 +322,16 @@ impl fmt::Debug for ReceiveEvent {
                 .debug_struct("Connecting")
                 .field("transfer_id", transfer_id)
                 .finish(),
+            Self::Connected { transfer_id } => formatter
+                .debug_struct("Connected")
+                .field("transfer_id", transfer_id)
+                .finish(),
             Self::Authenticating { transfer_id } => formatter
                 .debug_struct("Authenticating")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::Negotiating { transfer_id } => formatter
+                .debug_struct("Negotiating")
                 .field("transfer_id", transfer_id)
                 .finish(),
             Self::Started { transfer_id } => formatter
@@ -394,6 +413,23 @@ impl ReceiveViewState {
         self.progress
     }
 
+    pub fn progress_speed_bps(&self) -> Option<u64> {
+        if !self.progress_available || self.phase != ReceivePhase::Transferring {
+            return None;
+        }
+        self.progress
+            .filter(|(_, _, speed_bps)| *speed_bps > 0)
+            .map(|(_, _, speed_bps)| speed_bps)
+    }
+
+    pub fn progress_eta_seconds(&self) -> Option<u64> {
+        if !self.progress_available || self.phase != ReceivePhase::Transferring {
+            return None;
+        }
+        self.progress
+            .and_then(|(transferred, total, speed_bps)| eta_seconds(transferred, total, speed_bps))
+    }
+
     pub fn progress_available(&self) -> bool {
         self.progress_available
     }
@@ -404,7 +440,9 @@ impl ReceiveViewState {
             ReceivePhase::Preflighting
                 | ReceivePhase::Starting
                 | ReceivePhase::Connecting
+                | ReceivePhase::Connected
                 | ReceivePhase::Authenticating
+                | ReceivePhase::Negotiating
                 | ReceivePhase::Transferring
                 | ReceivePhase::Verifying
                 | ReceivePhase::Cancelling
@@ -451,7 +489,9 @@ impl ReceiveViewState {
                 | ReceivePhase::Preflighting
                 | ReceivePhase::Starting
                 | ReceivePhase::Connecting
+                | ReceivePhase::Connected
                 | ReceivePhase::Authenticating
+                | ReceivePhase::Negotiating
                 | ReceivePhase::Transferring
                 | ReceivePhase::Verifying
                 | ReceivePhase::Cancelling
@@ -464,7 +504,9 @@ impl ReceiveViewState {
                 self.phase,
                 ReceivePhase::Starting
                     | ReceivePhase::Connecting
+                    | ReceivePhase::Connected
                     | ReceivePhase::Authenticating
+                    | ReceivePhase::Negotiating
                     | ReceivePhase::Transferring
                     | ReceivePhase::Verifying
             )
@@ -522,6 +564,8 @@ impl ReceiveViewState {
             ReceiveAction::Start if self.start_enabled() => {
                 let destination = self.destination.clone()?;
                 self.phase = ReceivePhase::Starting;
+                self.progress = None;
+                self.progress_available = true;
                 self.error = None;
                 self.failure = None;
                 Some(ReceiveIntent::Start {
@@ -613,6 +657,8 @@ impl ReceiveViewState {
             ReceiveEvent::Created { transfer_id } => {
                 if self.phase == ReceivePhase::Starting && self.active_transfer_id.is_none() {
                     self.active_transfer_id = Some(transfer_id);
+                    self.progress = None;
+                    self.progress_available = true;
                 }
             }
             ReceiveEvent::Connecting { transfer_id } => {
@@ -620,9 +666,19 @@ impl ReceiveViewState {
                     self.phase = ReceivePhase::Connecting;
                 }
             }
+            ReceiveEvent::Connected { transfer_id } => {
+                if self.accepts_transfer(transfer_id) {
+                    self.phase = ReceivePhase::Connected;
+                }
+            }
             ReceiveEvent::Authenticating { transfer_id } => {
                 if self.accepts_transfer(transfer_id) {
                     self.phase = ReceivePhase::Authenticating;
+                }
+            }
+            ReceiveEvent::Negotiating { transfer_id } => {
+                if self.accepts_transfer(transfer_id) {
+                    self.phase = ReceivePhase::Negotiating;
                 }
             }
             ReceiveEvent::Started { transfer_id } => {
@@ -636,8 +692,27 @@ impl ReceiveViewState {
                 total,
                 speed_bps,
             } => {
-                if self.accepts_transfer(transfer_id) {
-                    self.progress = Some((transferred, total, speed_bps));
+                if self.accepts_transfer(transfer_id) && self.phase == ReceivePhase::Transferring {
+                    let previous = self.progress.map(|(transferred, total, speed_bps)| {
+                        Progress {
+                            transferred_bytes: transferred,
+                            total_bytes: total,
+                            speed_bps,
+                        }
+                    });
+                    let Some(progress) = accept_progress(
+                        previous,
+                        transferred,
+                        total,
+                        speed_bps,
+                    ) else {
+                        return;
+                    };
+                    self.progress = Some((
+                        progress.transferred_bytes,
+                        progress.total_bytes,
+                        progress.speed_bps,
+                    ));
                     self.phase = ReceivePhase::Transferring;
                 }
             }
@@ -793,6 +868,62 @@ mod tests {
         state.apply_event(ReceiveEvent::Completed { transfer_id });
         assert_eq!(state.phase(), ReceivePhase::Completed);
         assert_eq!(state.active_transfer_id(), None);
+    }
+
+    #[test]
+    fn receiver_progress_is_monotonic_and_eta_is_active_only() {
+        let mut state = ready_state();
+        state.handle_action(ReceiveAction::Start);
+        let transfer_id = TransferId::new();
+        state.mark_start_succeeded(transfer_id);
+        state.apply_event(ReceiveEvent::Started { transfer_id });
+        state.apply_event(ReceiveEvent::Progress {
+            transfer_id,
+            transferred: 25,
+            total: 100,
+            speed_bps: 25,
+        });
+
+        assert_eq!(state.progress(), Some((25, 100, 25)));
+        assert_eq!(state.progress_speed_bps(), Some(25));
+        assert_eq!(state.progress_eta_seconds(), Some(3));
+
+        state.apply_event(ReceiveEvent::Progress {
+            transfer_id,
+            transferred: 10,
+            total: 100,
+            speed_bps: 10,
+        });
+        assert_eq!(state.progress(), Some((25, 100, 25)));
+
+        state.apply_event(ReceiveEvent::Verifying { transfer_id });
+        assert_eq!(state.progress_eta_seconds(), None);
+        assert_eq!(state.progress_speed_bps(), None);
+        state.apply_event(ReceiveEvent::Progress {
+            transfer_id,
+            transferred: 50,
+            total: 100,
+            speed_bps: 25,
+        });
+        assert_eq!(state.phase(), ReceivePhase::Verifying);
+        assert_eq!(state.progress(), Some((25, 100, 25)));
+    }
+
+    #[test]
+    fn receiver_zero_total_or_speed_has_no_eta() {
+        let mut state = ready_state();
+        state.handle_action(ReceiveAction::Start);
+        let transfer_id = TransferId::new();
+        state.mark_start_succeeded(transfer_id);
+        state.apply_event(ReceiveEvent::Started { transfer_id });
+        state.apply_event(ReceiveEvent::Progress {
+            transfer_id,
+            transferred: 0,
+            total: 0,
+            speed_bps: 0,
+        });
+        assert_eq!(state.progress_eta_seconds(), None);
+        assert_eq!(state.progress_speed_bps(), None);
     }
 
     #[test]

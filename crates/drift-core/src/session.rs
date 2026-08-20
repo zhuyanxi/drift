@@ -43,6 +43,7 @@ pub enum Role {
 pub enum TransferState {
     Created,
     Connecting,
+    Connected,
     Authenticating,
     Negotiating,
     Transferring,
@@ -65,6 +66,8 @@ impl TransferState {
         matches!(
             (self, next),
             (Self::Created, Self::Connecting)
+                | (Self::Connecting, Self::Connected)
+                | (Self::Connected, Self::Authenticating)
                 | (Self::Connecting, Self::Authenticating)
                 | (Self::Authenticating, Self::Negotiating)
                 | (Self::Authenticating, Self::Transferring)
@@ -89,6 +92,10 @@ pub struct StateTransitionError {
 pub enum TransferError {
     #[error("invalid state transition")]
     InvalidStateTransition(#[from] StateTransitionError),
+    #[error("invalid transfer progress")]
+    InvalidProgress(#[from] crate::ProgressError),
+    #[error("progress update is not allowed in transfer state {0:?}")]
+    ProgressNotAllowed(TransferState),
     #[error("backend error: {0}")]
     Backend(String),
     #[error("transfer cancelled")]
@@ -106,6 +113,7 @@ pub enum TransferEvent {
     Connecting,
     Connected,
     Authenticating,
+    Negotiating,
     Started,
     CodeAvailable,
     MetadataReady,
@@ -210,7 +218,7 @@ impl TransferSession {
         total: u64,
         speed_bps: u64,
     ) -> Result<(), crate::ProgressError> {
-        self.progress = Progress::new(transferred, total, speed_bps)?;
+        self.progress = self.progress.update(transferred, total, speed_bps)?;
         Ok(())
     }
 }

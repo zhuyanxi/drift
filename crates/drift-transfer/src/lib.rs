@@ -63,6 +63,10 @@ where
         self.inner.sessions.read().await.get(&transfer_id).cloned()
     }
 
+    pub async fn sessions(&self) -> Vec<TransferSession> {
+        self.inner.sessions.read().await.values().cloned().collect()
+    }
+
     pub async fn start_send(&self, request: SendRequest) -> Result<TransferId, TransferError> {
         self.start_send_with_manifest(request, None).await
     }
@@ -98,11 +102,22 @@ where
             Ok(handle) => handle,
             Err(error) => return self.fail(transfer_id, error).await,
         };
-        self.emit(transfer_id, TransferEvent::Connected);
+        self.advance(
+            transfer_id,
+            TransferState::Connected,
+            TransferEvent::Connected,
+        )
+        .await?;
         self.advance(
             transfer_id,
             TransferState::Authenticating,
             TransferEvent::Authenticating,
+        )
+        .await?;
+        self.advance(
+            transfer_id,
+            TransferState::Negotiating,
+            TransferEvent::Negotiating,
         )
         .await?;
         self.advance(
@@ -131,11 +146,22 @@ where
             Ok(handle) => handle,
             Err(error) => return self.fail(transfer_id, error).await,
         };
-        self.emit(transfer_id, TransferEvent::Connected);
+        self.advance(
+            transfer_id,
+            TransferState::Connected,
+            TransferEvent::Connected,
+        )
+        .await?;
         self.advance(
             transfer_id,
             TransferState::Authenticating,
             TransferEvent::Authenticating,
+        )
+        .await?;
+        self.advance(
+            transfer_id,
+            TransferState::Negotiating,
+            TransferEvent::Negotiating,
         )
         .await?;
         self.advance(
@@ -161,6 +187,33 @@ where
         session.transition(TransferState::Cancelled)?;
         drop(sessions);
         self.emit(transfer_id, TransferEvent::Cancelled);
+        Ok(())
+    }
+
+    pub async fn update_progress(
+        &self,
+        transfer_id: TransferId,
+        transferred: u64,
+        total: u64,
+        speed_bps: u64,
+    ) -> Result<(), TransferError> {
+        let mut sessions = self.inner.sessions.write().await;
+        let session = sessions
+            .get_mut(&transfer_id)
+            .ok_or_else(|| TransferError::Backend("transfer session not found".into()))?;
+        if !matches!(session.state, TransferState::Transferring | TransferState::Resuming) {
+            return Err(TransferError::ProgressNotAllowed(session.state));
+        }
+        session.update_progress_with_total(transferred, total, speed_bps)?;
+        drop(sessions);
+        self.emit(
+            transfer_id,
+            TransferEvent::Progress {
+                transferred,
+                total,
+                speed_bps,
+            },
+        );
         Ok(())
     }
 
@@ -247,28 +300,22 @@ where
                 total,
                 speed_bps,
             } => {
-                let mut sessions = self.inner.sessions.write().await;
-                let session = sessions
-                    .get_mut(&transfer_id)
-                    .ok_or(BackendError::OutputParse {
-                        stream: "progress",
-                        reason: "missing transfer session",
-                    })?;
-                session
-                    .update_progress_with_total(transferred, total, speed_bps)
-                    .map_err(|_| BackendError::OutputParse {
-                        stream: "progress",
-                        reason: "progress exceeds total",
-                    })?;
-                drop(sessions);
-                self.emit(
-                    transfer_id,
-                    TransferEvent::Progress {
-                        transferred,
-                        total,
-                        speed_bps,
-                    },
-                );
+                match self
+                    .update_progress(transfer_id, transferred, total, speed_bps)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error @ TransferError::InvalidProgress(_))
+                    | Err(error @ TransferError::ProgressNotAllowed(_)) => {
+                        warn!(%transfer_id, %error, "ignored invalid or late progress event");
+                    }
+                    Err(_) => {
+                        return Err(BackendError::OutputParse {
+                            stream: "progress",
+                            reason: "missing transfer session",
+                        });
+                    }
+                }
             }
             BackendEvent::CapabilityUnavailable { capability } => {
                 let capability = match capability {
@@ -379,7 +426,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drift_core::{FileEntry, StateTransitionError, TransferCapability, TransferManifest};
+    use drift_core::{
+        FileEntry, ProgressError, StateTransitionError, TransferCapability, TransferManifest,
+    };
     use drift_protocol::CrocBackend;
     use std::{
         path::PathBuf,
@@ -447,6 +496,71 @@ mod tests {
         );
         assert_eq!(events.recv().await.unwrap().event, TransferEvent::Created);
         assert_eq!(events.recv().await.unwrap().event, TransferEvent::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn validates_progress_order_and_ignores_late_updates() {
+        let manager = TransferManager::new(CrocBackend::default());
+        let transfer_id = manager.create_session(Role::Sender).await;
+
+        assert_eq!(
+            manager.update_progress(transfer_id, 1, 10, 1).await,
+            Err(TransferError::ProgressNotAllowed(TransferState::Created))
+        );
+
+        for (state, event) in [
+            (TransferState::Connecting, TransferEvent::Connecting),
+            (TransferState::Connected, TransferEvent::Connected),
+            (TransferState::Authenticating, TransferEvent::Authenticating),
+            (TransferState::Negotiating, TransferEvent::Negotiating),
+            (TransferState::Transferring, TransferEvent::Started),
+        ] {
+            manager.advance(transfer_id, state, event).await.unwrap();
+        }
+
+        manager
+            .update_progress(transfer_id, 4, 10, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.session(transfer_id).await.unwrap().progress.transferred_bytes,
+            4
+        );
+        assert_eq!(
+            manager.update_progress(transfer_id, 3, 10, 2).await,
+            Err(TransferError::InvalidProgress(
+                ProgressError::TransferredDecreased
+            ))
+        );
+        assert_eq!(
+            manager.update_progress(transfer_id, 5, 11, 2).await,
+            Err(TransferError::InvalidProgress(ProgressError::TotalChanged))
+        );
+
+        manager
+            .advance(
+                transfer_id,
+                TransferState::Verifying,
+                TransferEvent::Verifying,
+            )
+            .await
+            .unwrap();
+        manager
+            .advance(
+                transfer_id,
+                TransferState::Completed,
+                TransferEvent::Completed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.update_progress(transfer_id, 10, 10, 2).await,
+            Err(TransferError::ProgressNotAllowed(TransferState::Completed))
+        );
+        assert_eq!(
+            manager.session(transfer_id).await.unwrap().progress.transferred_bytes,
+            4
+        );
     }
 
     #[test]
