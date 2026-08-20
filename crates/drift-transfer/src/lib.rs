@@ -305,8 +305,14 @@ where
                     .await
                 {
                     Ok(()) => {}
-                    Err(error @ TransferError::InvalidProgress(_))
-                    | Err(error @ TransferError::ProgressNotAllowed(_)) => {
+                    Err(error @ TransferError::InvalidProgress(_)) => {
+                        warn!(%transfer_id, %error, "invalid backend progress event");
+                        return Err(BackendError::OutputParse {
+                            stream: "progress",
+                            reason: "invalid progress update",
+                        });
+                    }
+                    Err(error @ TransferError::ProgressNotAllowed(_)) => {
                         warn!(%transfer_id, %error, "ignored invalid or late progress event");
                     }
                     Err(_) => {
@@ -561,6 +567,57 @@ mod tests {
             manager.session(transfer_id).await.unwrap().progress.transferred_bytes,
             4
         );
+    }
+
+    #[tokio::test]
+    async fn fails_transfer_when_backend_total_conflicts_with_manifest() {
+        let manager = TransferManager::new(CrocBackend::default());
+        let transfer_id = manager.create_session(Role::Sender).await;
+        let manifest =
+            TransferManifest::new(transfer_id, vec![FileEntry::new("file.txt", 10).unwrap()])
+                .unwrap();
+        manager
+            .inner
+            .sessions
+            .write()
+            .await
+            .get_mut(&transfer_id)
+            .unwrap()
+            .set_manifest(manifest);
+
+        for (state, event) in [
+            (TransferState::Connecting, TransferEvent::Connecting),
+            (TransferState::Connected, TransferEvent::Connected),
+            (TransferState::Authenticating, TransferEvent::Authenticating),
+            (TransferState::Negotiating, TransferEvent::Negotiating),
+            (TransferState::Transferring, TransferEvent::Started),
+        ] {
+            manager.advance(transfer_id, state, event).await.unwrap();
+        }
+
+        let error = manager
+            .apply_backend_event(
+                transfer_id,
+                BackendEvent::Progress {
+                    transferred: 1,
+                    total: 11,
+                    speed_bps: 1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            BackendError::OutputParse {
+                stream: "progress",
+                reason: "invalid progress update",
+            }
+        ));
+
+        manager.finish(transfer_id, Err(error)).await;
+        let session = manager.session(transfer_id).await.unwrap();
+        assert_eq!(session.state, TransferState::Failed);
+        assert_eq!(session.progress.transferred_bytes, 0);
     }
 
     #[test]
