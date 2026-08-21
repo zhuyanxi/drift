@@ -1,4 +1,6 @@
-use drift_app::{logging, AppReceiveController, AppSendController, AppState};
+use drift_app::{
+    logging, AppReceiveController, AppSendController, AppSettingsController, AppState,
+};
 
 fn main() {
     logging::init();
@@ -11,9 +13,10 @@ fn main() {
                 "drift services initialized"
             );
             let handle = app_state.handle();
-            drift_ui::run_with_controllers(
+            drift_ui::run_with_controllers_and_settings(
                 std::sync::Arc::new(AppSendController::new(handle.clone())),
-                std::sync::Arc::new(AppReceiveController::new(handle)),
+                std::sync::Arc::new(AppReceiveController::new(handle.clone())),
+                std::sync::Arc::new(AppSettingsController::new(handle)),
             );
             return;
         }

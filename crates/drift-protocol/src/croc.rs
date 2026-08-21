@@ -705,6 +705,45 @@ mod tests {
     }
 
     #[test]
+    fn request_relay_overrides_backend_fallback_for_both_roles() {
+        let backend = CrocBackend::new("croc").with_relay("fallback.example");
+        let send = SendRequest::new(vec![PathBuf::from("one.txt")])
+            .unwrap()
+            .with_relay("request.example");
+        let receive = ReceiveRequest::new("secret-code", "/tmp/out")
+            .unwrap()
+            .with_relay("request.example");
+
+        assert_eq!(
+            backend.send_args(&send).unwrap(),
+            vec![
+                "--relay",
+                "request.example",
+                "--disable-clipboard",
+                "send",
+                "one.txt"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            backend.receive_args(&receive).unwrap(),
+            vec![
+                "--relay",
+                "request.example",
+                "--yes",
+                "--disable-clipboard",
+                "--out",
+                "/tmp/out"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn builds_receiver_invocation_without_logging_code() {
         let backend = CrocBackend::new("croc");
         let request = ReceiveRequest::new("secret-code", "/tmp/out").unwrap();

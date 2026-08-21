@@ -1,4 +1,5 @@
 use crate::event_bridge::AppTransferUpdate;
+use crate::settings::{RelaySettings, SettingsError, SettingsValidationError};
 use crate::{AppCommand, AppCommandError, AppHandle};
 use drift_core::{
     ResumeRequest, Role, TransferCapability, TransferEvent, TransferId, TransferManifest,
@@ -6,9 +7,10 @@ use drift_core::{
 use drift_storage::{scan_send_paths, ScanCancellation, SourceScan, SourceScanError};
 use drift_ui::{
     ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture, ReceiveEventStream,
-    ReceiveFuture, RecoveryCandidate, RecoveryKind, SelectedItem, SendCommandError,
-    SendCommandErrorKind, SendController, SendEvent, SendEventFuture, SendEventStream, SendFuture,
-    SendProgress, SendSelection,
+    ReceiveFuture, RecoveryCandidate, RecoveryKind, RelaySettingsSnapshot, SelectedItem,
+    SendCommandError, SendCommandErrorKind, SendController, SendEvent, SendEventFuture,
+    SendEventStream, SendFuture, SendProgress, SendSelection, SettingsCommandError,
+    SettingsCommandErrorKind, SettingsController, SettingsFuture,
 };
 use std::{
     future::Future,
@@ -196,6 +198,83 @@ fn map_source_scan_error(error: SourceScanError) -> SendCommandError {
 #[derive(Clone)]
 pub struct AppReceiveController {
     handle: AppHandle,
+}
+
+#[derive(Clone)]
+pub struct AppSettingsController {
+    handle: AppHandle,
+}
+
+impl AppSettingsController {
+    pub fn new(handle: AppHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl SettingsController for AppSettingsController {
+    fn load(&self) -> SettingsFuture<Result<RelaySettingsSnapshot, SettingsCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle.settings().await {
+                Ok(Ok(settings)) => Ok(relay_snapshot(&settings.relay)),
+                Ok(Err(_)) | Err(_) => Err(settings_error(SettingsCommandErrorKind::LoadFailed)),
+            }
+        })
+    }
+
+    fn save(
+        &self,
+        enabled: bool,
+        endpoint: Option<String>,
+    ) -> SettingsFuture<Result<RelaySettingsSnapshot, SettingsCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            let current = match handle.settings().await {
+                Ok(Ok(settings)) => settings,
+                Ok(Err(_)) | Err(_) => {
+                    return Err(settings_error(SettingsCommandErrorKind::LoadFailed))
+                }
+            };
+            let relay = RelaySettings {
+                enabled,
+                url: endpoint,
+                credential_ref: current.relay.credential_ref,
+            };
+            match handle.update_relay(relay).await {
+                Ok(Ok(settings)) => Ok(relay_snapshot(&settings.relay)),
+                Ok(Err(error)) => Err(map_settings_error(&error)),
+                Err(_) => Err(settings_error(SettingsCommandErrorKind::SaveFailed)),
+            }
+        })
+    }
+
+    fn clear(&self) -> SettingsFuture<Result<RelaySettingsSnapshot, SettingsCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle.clear_relay().await {
+                Ok(Ok(settings)) => Ok(relay_snapshot(&settings.relay)),
+                Ok(Err(error)) => Err(map_settings_error(&error)),
+                Err(_) => Err(settings_error(SettingsCommandErrorKind::SaveFailed)),
+            }
+        })
+    }
+}
+
+fn relay_snapshot(relay: &RelaySettings) -> RelaySettingsSnapshot {
+    RelaySettingsSnapshot::new(relay.enabled, relay.url.clone())
+}
+
+fn settings_error(kind: SettingsCommandErrorKind) -> SettingsCommandError {
+    SettingsCommandError::new(kind)
+}
+
+fn map_settings_error(error: &AppCommandError) -> SettingsCommandError {
+    match error {
+        AppCommandError::Settings(SettingsError::Validation(
+            SettingsValidationError::MissingRelayUrl | SettingsValidationError::InvalidRelayUrl,
+        )) => settings_error(SettingsCommandErrorKind::InvalidRelay),
+        _ => settings_error(SettingsCommandErrorKind::SaveFailed),
+    }
 }
 
 impl AppReceiveController {
@@ -538,7 +617,9 @@ type _SendEventFutureCheck<'a> = Pin<Box<dyn Future<Output = Option<SendEvent>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drift_ui::{ReceiveEvent, SendEvent};
+    use drift_ui::{ReceiveEvent, SendEvent, SettingsCommandErrorKind, SettingsController};
+    use std::fs;
+    use uuid::Uuid;
 
     #[test]
     fn controller_error_messages_are_safe_for_ui() {
@@ -567,5 +648,36 @@ mod tests {
             }
         )
         .contains("secret-code"));
+    }
+
+    #[test]
+    fn settings_controller_rejects_invalid_endpoint_before_persisting() {
+        let root = std::env::temp_dir().join(format!("drift-app-ui-settings-{}", Uuid::new_v4()));
+        let config_path = root.join("config").join("config.json");
+        let settings = crate::settings::DriftSettings::default();
+        crate::settings::SettingsLoader::with_path(&config_path)
+            .save(&settings)
+            .unwrap();
+        let state = crate::AppState::bootstrap_with_config_path(&config_path).unwrap();
+        let controller = AppSettingsController::new(state.handle());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(controller.save(true, Some("ftp://relay.example.test".into())))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), SettingsCommandErrorKind::InvalidRelay);
+        assert_eq!(
+            crate::settings::SettingsLoader::with_path(&config_path)
+                .load()
+                .unwrap()
+                .settings
+                .relay,
+            settings.relay
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

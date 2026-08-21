@@ -1,6 +1,7 @@
 mod send;
 mod receive;
 mod progress;
+mod settings;
 
 pub use receive::{
     ReceiveAction, ReceiveCommandError, ReceiveCommandErrorKind, ReceiveController, ReceiveEvent,
@@ -11,6 +12,10 @@ pub use send::{
     CopyFeedback, SelectedItem, SelectionError, SendAction, SendCommandError, SendCommandErrorKind,
     SendController, SendEvent, SendEventFuture, SendEventStream, SendFuture, SendIntent, SendPhase,
     SendProgress, SendSelection, SendViewState,
+};
+pub use settings::{
+    RelaySettingsSnapshot, SettingsAction, SettingsCommandError, SettingsCommandErrorKind,
+    SettingsController, SettingsFuture, SettingsIntent, SettingsPhase, SettingsViewState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +45,8 @@ mod gui {
         ReceiveAction, ReceiveCommandError, ReceiveController, ReceiveEventStream, ReceiveIntent,
         ReceivePhase, ReceiveViewState, RecoveryCandidate, RecoveryKind, SendAction,
         SendCommandError, SendController, SendEventStream, SendIntent, SendPhase, SendViewState,
+        RelaySettingsSnapshot, SettingsAction, SettingsCommandError, SettingsCommandErrorKind,
+        SettingsController, SettingsFuture, SettingsIntent, SettingsViewState,
     };
 
     actions!(
@@ -57,7 +64,7 @@ mod gui {
             DiscardReceiveRecovery
         ]
     );
-    actions!(navigation, [ShowSend, ShowReceive]);
+    actions!(navigation, [ShowSend, ShowReceive, ShowSettings]);
 
     trait ClipboardService: Send + Sync {
         fn copy(&self, value: &str, cx: &mut App) -> Result<(), ()>;
@@ -187,10 +194,43 @@ mod gui {
         }
     }
 
+    struct UnavailableSettingsController;
+
+    impl SettingsController for UnavailableSettingsController {
+        fn load(&self) -> SettingsFuture<Result<RelaySettingsSnapshot, SettingsCommandError>> {
+            Box::pin(async {
+                Err(SettingsCommandError::new(
+                    SettingsCommandErrorKind::LoadFailed,
+                ))
+            })
+        }
+
+        fn save(
+            &self,
+            _enabled: bool,
+            _endpoint: Option<String>,
+        ) -> SettingsFuture<Result<RelaySettingsSnapshot, SettingsCommandError>> {
+            Box::pin(async {
+                Err(SettingsCommandError::new(
+                    SettingsCommandErrorKind::SaveFailed,
+                ))
+            })
+        }
+
+        fn clear(&self) -> SettingsFuture<Result<RelaySettingsSnapshot, SettingsCommandError>> {
+            Box::pin(async {
+                Err(SettingsCommandError::new(
+                    SettingsCommandErrorKind::SaveFailed,
+                ))
+            })
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MainRoute {
         Send,
         Receive,
+        Settings,
     }
 
     pub struct MainView {
@@ -198,14 +238,18 @@ mod gui {
         route: MainRoute,
         send: SendViewState,
         receive: ReceiveViewState,
+        settings: SettingsViewState,
         controller: Arc<dyn SendController>,
         receive_controller: Arc<dyn ReceiveController>,
+        settings_controller: Arc<dyn SettingsController>,
         clipboard: Arc<dyn ClipboardService>,
         path_picker: Arc<dyn SendPathPicker>,
         receive_focus: FocusHandle,
+        settings_focus: FocusHandle,
         _send_event_task: Task<()>,
         _receive_event_task: Task<()>,
         _recovery_task: Task<()>,
+        _settings_task: Task<()>,
         recovery_candidates: Vec<RecoveryCandidate>,
         command_task: Option<Task<()>>,
     }
@@ -215,12 +259,14 @@ mod gui {
             startup_error: Option<String>,
             controller: Arc<dyn SendController>,
             receive_controller: Arc<dyn ReceiveController>,
+            settings_controller: Arc<dyn SettingsController>,
             cx: &mut Context<Self>,
         ) -> Self {
             Self::new_with_clipboard(
                 startup_error,
                 controller,
                 receive_controller,
+                settings_controller,
                 Arc::new(GpuiClipboard),
                 cx,
             )
@@ -230,6 +276,7 @@ mod gui {
             startup_error: Option<String>,
             controller: Arc<dyn SendController>,
             receive_controller: Arc<dyn ReceiveController>,
+            settings_controller: Arc<dyn SettingsController>,
             clipboard: Arc<dyn ClipboardService>,
             cx: &mut Context<Self>,
         ) -> Self {
@@ -298,19 +345,36 @@ mod gui {
                     },
                 ))
             });
+            let settings_controller_for_load = Arc::clone(&settings_controller);
+            let settings_task = cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    let result = settings_controller_for_load.load().await;
+                    let _ = this.update(&mut *cx, |view, cx| {
+                        match result {
+                            Ok(snapshot) => view.settings.apply_loaded(snapshot),
+                            Err(error) => view.settings.mark_failed(error),
+                        }
+                        cx.notify();
+                    });
+                },
+            );
             Self {
                 startup_error,
                 route: MainRoute::Send,
                 send: SendViewState::new(),
                 receive,
+                settings: SettingsViewState::new(),
                 controller,
                 receive_controller,
+                settings_controller,
                 clipboard,
                 path_picker: Arc::new(GpuiSendPathPicker),
                 receive_focus: cx.focus_handle(),
+                settings_focus: cx.focus_handle(),
                 _send_event_task: send_event_task,
                 _receive_event_task: receive_event_task,
                 _recovery_task: recovery_task,
+                _settings_task: settings_task,
                 recovery_candidates: Vec::new(),
                 command_task: initial_command_task,
             }
@@ -381,6 +445,60 @@ mod gui {
                     self.cancel_receive_transfer(transfer_id, cx)
                 }
             }
+        }
+
+        fn dispatch_settings_action(&mut self, action: SettingsAction, cx: &mut Context<Self>) {
+            let Some(intent) = self.settings.handle_action(action) else {
+                return;
+            };
+            cx.notify();
+            self.run_settings_intent(intent, cx);
+        }
+
+        fn run_settings_intent(&mut self, intent: SettingsIntent, cx: &mut Context<Self>) {
+            match intent {
+                SettingsIntent::Save { enabled, endpoint } => {
+                    self.save_settings(enabled, endpoint, cx)
+                }
+                SettingsIntent::Clear => self.clear_settings(cx),
+            }
+        }
+
+        fn save_settings(
+            &mut self,
+            enabled: bool,
+            endpoint: Option<String>,
+            cx: &mut Context<Self>,
+        ) {
+            let controller = Arc::clone(&self.settings_controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    let result = controller.save(enabled, endpoint).await;
+                    let _ = this.update(&mut *cx, |view, cx| {
+                        match result {
+                            Ok(snapshot) => view.settings.mark_saved(snapshot),
+                            Err(error) => view.settings.mark_failed(error),
+                        }
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+
+        fn clear_settings(&mut self, cx: &mut Context<Self>) {
+            let controller = Arc::clone(&self.settings_controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    let result = controller.clear().await;
+                    let _ = this.update(&mut *cx, |view, cx| {
+                        match result {
+                            Ok(snapshot) => view.settings.mark_saved(snapshot),
+                            Err(error) => view.settings.mark_failed(error),
+                        }
+                        cx.notify();
+                    });
+                },
+            ));
         }
 
         fn start_choose_destination(&mut self, cx: &mut Context<Self>) {
@@ -701,6 +819,60 @@ mod gui {
             _cx: &mut Context<Self>,
         ) {
             window.focus(&self.receive_focus);
+        }
+
+        fn on_settings_key_down(
+            &mut self,
+            event: &KeyDownEvent,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            if self.route != MainRoute::Settings
+                || event.is_held
+                || !self.settings.input_enabled()
+            {
+                return;
+            }
+            let keystroke = &event.keystroke;
+            if keystroke.key == "backspace" {
+                let mut endpoint = self.settings.endpoint().to_owned();
+                endpoint.pop();
+                self.settings.set_endpoint(endpoint);
+                cx.notify();
+                return;
+            }
+            if keystroke.key == "v"
+                && (keystroke.modifiers.platform || keystroke.modifiers.control)
+            {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    let endpoint = text.replace('\n', "").replace('\r', "");
+                    self.settings.set_endpoint(endpoint);
+                    cx.notify();
+                }
+                return;
+            }
+            if keystroke.modifiers.control
+                || keystroke.modifiers.alt
+                || keystroke.modifiers.platform
+                || keystroke.modifiers.function
+            {
+                return;
+            }
+            if let Some(input) = keystroke.key_char.as_ref() {
+                let mut endpoint = self.settings.endpoint().to_owned();
+                endpoint.push_str(input);
+                self.settings.set_endpoint(endpoint);
+                cx.notify();
+            }
+        }
+
+        fn focus_settings_input(
+            &mut self,
+            _: &MouseDownEvent,
+            window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+            window.focus(&self.settings_focus);
         }
 
         fn start_choose(&mut self, cx: &mut Context<Self>) {
@@ -1031,6 +1203,10 @@ mod gui {
                     view.route = MainRoute::Receive;
                     cx.notify();
                 }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowSettings, _, cx| {
+                    view.route = MainRoute::Settings;
+                    cx.notify();
+                }))
                 .child(div().child("Send"))
                 .child(self.render_navigation(cx))
                 .child(div().child(phase.label()))
@@ -1124,6 +1300,107 @@ mod gui {
                         .text_color(gpui::rgb(0x9a3025))
                         .child(error.to_owned()),
                 );
+            }
+            root.into_any_element()
+        }
+
+        fn render_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+            let save = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.dispatch_settings_action(SettingsAction::Save, cx);
+            });
+            let clear = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.dispatch_settings_action(SettingsAction::Clear, cx);
+            });
+            let enabled = !self.settings.enabled();
+            let toggle = cx.listener(move |view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.dispatch_settings_action(SettingsAction::SetEnabled { enabled }, cx);
+            });
+            let endpoint = if self.settings.endpoint().is_empty() {
+                "Enter a Croc-compatible relay endpoint".to_owned()
+            } else {
+                self.settings.endpoint().to_owned()
+            };
+            let relay_state = if self.settings.enabled() {
+                "Custom relay enabled"
+            } else {
+                "Default relay behavior"
+            };
+            let mut root = div()
+                .id("settings-view")
+                .key_context("SettingsView")
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowSend, _, cx| {
+                    view.route = MainRoute::Send;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowSettings, _, cx| {
+                    view.route = MainRoute::Settings;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowReceive, _, cx| {
+                    view.route = MainRoute::Receive;
+                    cx.notify();
+                }))
+                .size_full()
+                .p_8()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .bg(gpui::rgb(0xf7f4ee))
+                .text_color(gpui::rgb(0x1d2a24))
+                .child(div().child("Settings"))
+                .child(self.render_navigation(cx))
+                .child(div().child(self.settings.phase().label()))
+                .child(div().child(relay_state))
+                .child(
+                    div()
+                        .id("settings-endpoint-input")
+                        .track_focus(&self.settings_focus)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view: &mut MainView, event, window, cx| {
+                                view.focus_settings_input(event, window, cx);
+                            }),
+                        )
+                        .on_key_down(cx.listener(|view: &mut MainView, event, window, cx| {
+                            view.on_settings_key_down(event, window, cx);
+                        }))
+                        .p_4()
+                        .border_1()
+                        .border_color(gpui::rgb(0xd7d0c4))
+                        .rounded_sm()
+                        .bg(gpui::rgb(0xffffff))
+                        .child(endpoint),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(action_button(
+                            "settings-toggle",
+                            if self.settings.enabled() {
+                                "Disable custom relay"
+                            } else {
+                                "Enable custom relay"
+                            },
+                            self.settings.input_enabled(),
+                            toggle,
+                        ))
+                        .child(action_button(
+                            "settings-save",
+                            "Save relay",
+                            self.settings.save_enabled(),
+                            save,
+                        ))
+                        .child(action_button(
+                            "settings-clear",
+                            "Use default relay",
+                            self.settings.clear_enabled(),
+                            clear,
+                        )),
+                );
+            if let Some(error) = self.settings.error() {
+                root = root.child(div().text_color(gpui::rgb(0x9a3025)).child(error.to_owned()));
             }
             root.into_any_element()
         }
@@ -1367,17 +1644,22 @@ mod gui {
                 view.route = MainRoute::Receive;
                 cx.notify();
             });
+            let settings = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.route = MainRoute::Settings;
+                cx.notify();
+            });
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(action_button("route-send", "Send", self.route == MainRoute::Send, send))
+                .child(action_button("route-send", "Send", true, send))
                 .child(action_button(
                     "route-receive",
                     "Receive",
-                    self.route == MainRoute::Receive,
+                    true,
                     receive,
                 ))
+                .child(action_button("route-settings", "Settings", true, settings))
                 .into_any_element()
         }
     }
@@ -1390,6 +1672,7 @@ mod gui {
                 match self.route {
                     MainRoute::Send => self.render_send(cx),
                     MainRoute::Receive => self.render_receive(cx),
+                    MainRoute::Settings => self.render_settings(cx),
                 }
             }
         }
@@ -1484,7 +1767,24 @@ mod gui {
         controller: Arc<dyn SendController>,
         receive_controller: Arc<dyn ReceiveController>,
     ) {
-        run_with_startup_error_and_controllers(None, controller, receive_controller);
+        run_with_controllers_and_settings(
+            controller,
+            receive_controller,
+            Arc::new(UnavailableSettingsController),
+        );
+    }
+
+    pub fn run_with_controllers_and_settings(
+        controller: Arc<dyn SendController>,
+        receive_controller: Arc<dyn ReceiveController>,
+        settings_controller: Arc<dyn SettingsController>,
+    ) {
+        run_with_startup_error_and_controllers(
+            None,
+            controller,
+            receive_controller,
+            settings_controller,
+        );
     }
 
     pub fn run_with_startup_error(startup_error: Option<String>) {
@@ -1492,6 +1792,7 @@ mod gui {
             startup_error,
             Arc::new(UnavailableSendController),
             Arc::new(UnavailableReceiveController),
+            Arc::new(UnavailableSettingsController),
         );
     }
 
@@ -1499,6 +1800,7 @@ mod gui {
         startup_error: Option<String>,
         controller: Arc<dyn SendController>,
         receive_controller: Arc<dyn ReceiveController>,
+        settings_controller: Arc<dyn SettingsController>,
     ) {
         Application::new().run(move |cx: &mut App| {
             cx.bind_keys([
@@ -1516,6 +1818,7 @@ mod gui {
                         startup_error,
                         controller,
                         receive_controller,
+                        settings_controller,
                         cx,
                     )
                 })
@@ -1532,7 +1835,8 @@ mod gui {
 
 #[cfg(feature = "gui")]
 pub use gui::{
-    run, run_with_controller, run_with_controllers, run_with_startup_error, MainView,
+    run, run_with_controller, run_with_controllers, run_with_controllers_and_settings,
+    run_with_startup_error, MainView,
 };
 
 #[cfg(not(feature = "gui"))]
@@ -1553,6 +1857,15 @@ pub fn run_with_controller(_controller: std::sync::Arc<dyn SendController>) {
 pub fn run_with_controllers(
     _controller: std::sync::Arc<dyn SendController>,
     _receive_controller: std::sync::Arc<dyn ReceiveController>,
+) {
+    eprintln!("drift GUI disabled; rebuild with --features gui");
+}
+
+#[cfg(not(feature = "gui"))]
+pub fn run_with_controllers_and_settings(
+    _controller: std::sync::Arc<dyn SendController>,
+    _receive_controller: std::sync::Arc<dyn ReceiveController>,
+    _settings_controller: std::sync::Arc<dyn SettingsController>,
 ) {
     eprintln!("drift GUI disabled; rebuild with --features gui");
 }

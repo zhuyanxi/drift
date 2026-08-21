@@ -1,6 +1,7 @@
 use crate::event_bridge::{AppEventBridge, AppTransferUpdate, TransferPresentation};
 use crate::settings::{
-    ConfigPathError, DriftSettings, SettingsError, SettingsLoader, SettingsSource,
+    ConfigPathError, DriftSettings, RelaySettings, SettingsError, SettingsLoader, SettingsSource,
+    SettingsStore,
 };
 use drift_core::{
     ResumeRequest, ResumeState, TransferCapability, TransferError, TransferId, TransferManifest,
@@ -52,6 +53,7 @@ pub struct AppState {
     transfer_manager: TransferManager<CrocBackend>,
     event_bridge: AppEventBridge,
     resume_store: JsonStore,
+    settings_store: SettingsStore,
     runtime: Runtime,
 }
 
@@ -82,7 +84,7 @@ impl AppState {
     }
 
     pub fn custom_relay_configured(&self) -> bool {
-        self.settings.relay.url.is_some()
+        self.settings.relay.effective_url().is_some()
     }
 
     pub fn transfer_manager(&self) -> &TransferManager<CrocBackend> {
@@ -100,6 +102,7 @@ impl AppState {
             transfer_manager: self.transfer_manager.clone(),
             event_bridge: self.event_bridge.clone(),
             resume_store: self.resume_store.clone(),
+            settings_store: self.settings_store.clone(),
             default_receive_directory: self.settings.transfer.default_receive_directory.clone(),
         }
     }
@@ -110,11 +113,9 @@ impl AppState {
             .enable_all()
             .build()
             .map_err(AppError::Runtime)?;
-        let mut backend = CrocBackend::new(&loaded.settings.transfer.croc_executable)
+        let backend = CrocBackend::new(&loaded.settings.transfer.croc_executable)
             .with_timeout(loaded.settings.transfer.timeout);
-        if let Some(relay) = loaded.settings.relay.url.clone() {
-            backend = backend.with_relay(relay);
-        }
+        let settings_store = SettingsStore::new(loader.clone(), loaded.settings.clone());
         let resume_store = JsonStore::new(resume_root(loader.path()));
         let transfer_manager =
             TransferManager::with_resume_store(backend.clone(), "croc", resume_store.clone());
@@ -128,6 +129,7 @@ impl AppState {
             transfer_manager,
             event_bridge,
             resume_store,
+            settings_store,
             runtime,
         })
     }
@@ -140,6 +142,7 @@ pub struct AppHandle {
     transfer_manager: TransferManager<CrocBackend>,
     event_bridge: AppEventBridge,
     resume_store: JsonStore,
+    settings_store: SettingsStore,
     default_receive_directory: PathBuf,
 }
 
@@ -157,6 +160,30 @@ impl AppHandle {
 
     pub fn default_receive_directory(&self) -> PathBuf {
         self.default_receive_directory.clone()
+    }
+
+    pub fn settings(&self) -> JoinHandle<Result<DriftSettings, AppCommandError>> {
+        let settings_store = self.settings_store.clone();
+        self.runtime
+            .spawn_blocking(move || settings_store.snapshot().map_err(AppCommandError::from))
+    }
+
+    pub fn update_relay(
+        &self,
+        relay: RelaySettings,
+    ) -> JoinHandle<Result<DriftSettings, AppCommandError>> {
+        let settings_store = self.settings_store.clone();
+        self.runtime.spawn_blocking(move || {
+            settings_store
+                .update_relay(relay)
+                .map_err(AppCommandError::from)
+        })
+    }
+
+    pub fn clear_relay(&self) -> JoinHandle<Result<DriftSettings, AppCommandError>> {
+        let settings_store = self.settings_store.clone();
+        self.runtime
+            .spawn_blocking(move || settings_store.clear_relay().map_err(AppCommandError::from))
     }
 
     pub fn validate_destination(
@@ -183,11 +210,13 @@ impl AppHandle {
     pub fn dispatch(&self, command: AppCommand) -> JoinHandle<Result<TransferId, AppCommandError>> {
         let transfer_manager = self.transfer_manager.clone();
         let resume_store = self.resume_store.clone();
+        let settings_store = self.settings_store.clone();
         let default_receive_directory = self.default_receive_directory.clone();
         self.runtime.spawn(async move {
             dispatch_command(
                 transfer_manager,
                 resume_store,
+                settings_store,
                 default_receive_directory,
                 command,
             )
@@ -309,6 +338,8 @@ pub enum AppCommandError {
     RecoveryInvalid,
     #[error("recovery storage is unavailable")]
     RecoveryStorage(#[source] StorageError),
+    #[error("settings could not be updated")]
+    Settings(#[source] SettingsError),
 }
 
 impl AppCommandError {
@@ -331,6 +362,7 @@ impl AppCommandError {
                 "The transfer recovery is no longer available."
             }
             Self::RecoveryStorage(_) => "Transfer recovery storage is unavailable.",
+            Self::Settings(_) => "Settings could not be saved.",
         }
     }
 }
@@ -359,15 +391,24 @@ impl From<StorageError> for AppCommandError {
     }
 }
 
+impl From<SettingsError> for AppCommandError {
+    fn from(error: SettingsError) -> Self {
+        Self::Settings(error)
+    }
+}
+
 async fn dispatch_command(
     transfer_manager: TransferManager<CrocBackend>,
     resume_store: JsonStore,
+    settings_store: SettingsStore,
     default_receive_directory: PathBuf,
     command: AppCommand,
 ) -> Result<TransferId, AppCommandError> {
     match command {
         AppCommand::Send { paths, manifest } => {
+            let settings = settings_store.snapshot().map_err(AppCommandError::from)?;
             let request = SendRequest::new(paths).map_err(AppCommandError::InvalidRequest)?;
+            let request = apply_relay(request, &settings);
             transfer_manager
                 .start_send_with_manifest(request, Some(manifest))
                 .await
@@ -377,6 +418,7 @@ async fn dispatch_command(
             code,
             output_directory,
         } => {
+            let settings = settings_store.snapshot().map_err(AppCommandError::from)?;
             let output_directory = output_directory.unwrap_or(default_receive_directory);
             if code.trim().is_empty() {
                 return Err(AppCommandError::EmptyTransferCode);
@@ -386,6 +428,7 @@ async fn dispatch_command(
                 .map_err(AppCommandError::from)?;
             let request = ReceiveRequest::new(code, output_directory)
                 .map_err(AppCommandError::InvalidRequest)?;
+            let request = apply_relay(request, &settings);
             transfer_manager
                 .start_receive(request)
                 .await
@@ -437,6 +480,32 @@ async fn dispatch_command(
             .await
             .map(|()| transfer_id)
             .map_err(AppCommandError::from),
+    }
+}
+
+fn apply_relay<T>(request: T, settings: &DriftSettings) -> T
+where
+    T: RelayRequest,
+{
+    match settings.relay.effective_url() {
+        Some(relay) => request.with_relay(relay.to_owned()),
+        None => request,
+    }
+}
+
+trait RelayRequest: Sized {
+    fn with_relay(self, relay: String) -> Self;
+}
+
+impl RelayRequest for SendRequest {
+    fn with_relay(self, relay: String) -> Self {
+        SendRequest::with_relay(self, relay)
+    }
+}
+
+impl RelayRequest for ReceiveRequest {
+    fn with_relay(self, relay: String) -> Self {
+        ReceiveRequest::with_relay(self, relay)
     }
 }
 
@@ -571,6 +640,63 @@ mod tests {
     }
 
     #[test]
+    fn relay_settings_are_snapshotted_for_send_and_receive_requests() {
+        let root = temp_path();
+        let loader = SettingsLoader::with_path(root.join("config.json"));
+        let store = SettingsStore::new(loader, DriftSettings::default());
+        store
+            .update_relay(RelaySettings {
+                enabled: true,
+                url: Some("https://first-relay.example.test".into()),
+                credential_ref: None,
+            })
+            .unwrap();
+
+        let first_settings = store.snapshot().unwrap();
+        let send = apply_relay(
+            SendRequest::new(vec![PathBuf::from("source.txt")]).unwrap(),
+            &first_settings,
+        );
+        let receive = apply_relay(
+            ReceiveRequest::new("transfer-code", &root).unwrap(),
+            &first_settings,
+        );
+
+        store
+            .update_relay(RelaySettings {
+                enabled: true,
+                url: Some("https://second-relay.example.test".into()),
+                credential_ref: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            send.relay.as_deref(),
+            Some("https://first-relay.example.test")
+        );
+        assert_eq!(
+            receive.relay.as_deref(),
+            Some("https://first-relay.example.test")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disabled_relay_settings_leave_default_request_routing_untouched() {
+        let mut settings = DriftSettings::default();
+        settings.relay = RelaySettings {
+            enabled: false,
+            url: Some("https://configured-but-disabled.example.test".into()),
+            credential_ref: None,
+        };
+        let request = apply_relay(
+            SendRequest::new(vec![PathBuf::from("source.txt")]).unwrap(),
+            &settings,
+        );
+        assert_eq!(request.relay, None);
+    }
+
+    #[test]
     fn pause_and_resume_commands_report_unsupported_backend_safely() {
         let root = temp_path();
         let config_path = root.join("config").join("config.json");
@@ -639,6 +765,10 @@ mod tests {
         let result = runtime.block_on(dispatch_command(
             manager,
             store,
+            SettingsStore::new(
+                SettingsLoader::with_path(root.join("config.json")),
+                DriftSettings::default(),
+            ),
             root.clone(),
             AppCommand::RecoverTransfer {
                 transfer_id,
@@ -683,6 +813,10 @@ mod tests {
         let result = runtime.block_on(dispatch_command(
             TransferManager::new(CrocBackend::default()),
             store.clone(),
+            SettingsStore::new(
+                SettingsLoader::with_path(root.join("config.json")),
+                DriftSettings::default(),
+            ),
             output_directory,
             AppCommand::RecoverTransfer {
                 transfer_id,
@@ -746,6 +880,10 @@ mod tests {
             let transfer_id = dispatch_command(
                 manager.clone(),
                 resume_store.clone(),
+                SettingsStore::new(
+                    SettingsLoader::with_path(root.join("config.json")),
+                    DriftSettings::default(),
+                ),
                 receive_directory.clone(),
                 AppCommand::Receive {
                     code: "transfer-code".into(),
@@ -772,6 +910,10 @@ mod tests {
         let retry_result = runtime.block_on(dispatch_command(
             manager,
             resume_store,
+            SettingsStore::new(
+                SettingsLoader::with_path(root.join("config.json")),
+                DriftSettings::default(),
+            ),
             root.clone(),
             AppCommand::RetryTransfer {
                 transfer_id: result,

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     env, fmt, fs, io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use thiserror::Error;
@@ -33,6 +34,7 @@ impl fmt::Debug for DriftSettings {
         formatter
             .debug_struct("DriftSettings")
             .field("relay_configured", &self.relay.url.is_some())
+            .field("relay", &self.relay)
             .field("transfer", &self.transfer)
             .field("ui", &self.ui)
             .field("privacy", &self.privacy)
@@ -45,11 +47,7 @@ impl DriftSettings {
         if self.transfer.croc_executable.as_os_str().is_empty() {
             return Err(SettingsValidationError::EmptyCrocExecutable);
         }
-        if let Some(url) = self.relay.url.as_deref() {
-            if !is_valid_relay_url(url) {
-                return Err(SettingsValidationError::InvalidRelayUrl);
-            }
-        }
+        self.relay.validate()?;
         if self.transfer.timeout.is_zero() {
             return Err(SettingsValidationError::NonPositiveTimeout);
         }
@@ -61,24 +59,84 @@ impl DriftSettings {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct RelaySettings {
+    pub enabled: bool,
     pub url: Option<String>,
+    pub credential_ref: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for RelaySettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct RelaySettingsData {
+            enabled: Option<bool>,
+            url: Option<String>,
+            credential_ref: Option<String>,
+        }
+
+        let data = RelaySettingsData::deserialize(deserializer)?;
+        Ok(Self {
+            enabled: data.enabled.unwrap_or(data.url.is_some()),
+            url: data.url,
+            credential_ref: data.credential_ref,
+        })
+    }
+}
+
+impl RelaySettings {
+    pub fn validate(&self) -> Result<(), SettingsValidationError> {
+        if let Some(url) = self.url.as_deref() {
+            if !is_valid_relay_url(url) {
+                return Err(SettingsValidationError::InvalidRelayUrl);
+            }
+        } else if self.enabled {
+            return Err(SettingsValidationError::MissingRelayUrl);
+        }
+        if self
+            .credential_ref
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(SettingsValidationError::InvalidRelayCredentialRef);
+        }
+        Ok(())
+    }
+
+    pub fn effective_url(&self) -> Option<&str> {
+        self.enabled.then_some(self.url.as_deref()).flatten()
+    }
+
+    pub fn clear(&mut self) {
+        self.enabled = false;
+        self.url = None;
+        self.credential_ref = None;
+    }
 }
 
 impl fmt::Debug for RelaySettings {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RelaySettings")
+            .field("enabled", &self.enabled)
             .field("url_configured", &self.url.is_some())
+            .field("credential_ref_configured", &self.credential_ref.is_some())
             .finish()
     }
 }
 
 impl Default for RelaySettings {
     fn default() -> Self {
-        Self { url: None }
+        Self {
+            enabled: false,
+            url: None,
+            credential_ref: None,
+        }
     }
 }
 
@@ -150,8 +208,12 @@ impl Default for PrivacySettings {
 pub enum SettingsValidationError {
     #[error("croc executable path must not be empty")]
     EmptyCrocExecutable,
+    #[error("relay endpoint must be configured when custom relay is enabled")]
+    MissingRelayUrl,
     #[error("relay URL must use http or https and include a host")]
     InvalidRelayUrl,
+    #[error("relay credential reference must not be empty")]
+    InvalidRelayCredentialRef,
     #[error("transfer timeout must be positive")]
     NonPositiveTimeout,
     #[error("default receive directory must not be empty")]
@@ -184,6 +246,8 @@ pub enum SettingsError {
     Serialization(#[source] serde_json::Error),
     #[error("configuration file could not be written")]
     Write(#[source] io::Error),
+    #[error("configuration state is unavailable")]
+    StateUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +274,49 @@ pub struct LoadedSettings {
 #[derive(Debug, Clone)]
 pub struct SettingsLoader {
     path: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct SettingsStore {
+    loader: SettingsLoader,
+    settings: Arc<Mutex<DriftSettings>>,
+}
+
+impl SettingsStore {
+    pub fn new(loader: SettingsLoader, settings: DriftSettings) -> Self {
+        Self {
+            loader,
+            settings: Arc::new(Mutex::new(settings)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Result<DriftSettings, SettingsError> {
+        self.settings
+            .lock()
+            .map_err(|_| SettingsError::StateUnavailable)
+            .and_then(|settings| {
+                settings.validate()?;
+                Ok(settings.clone())
+            })
+    }
+
+    pub fn update_relay(&self, relay: RelaySettings) -> Result<DriftSettings, SettingsError> {
+        let mut current = self
+            .settings
+            .lock()
+            .map_err(|_| SettingsError::StateUnavailable)?;
+        let mut updated = current.clone();
+        updated.relay = relay;
+        self.loader.save(&updated)?;
+        *current = updated.clone();
+        Ok(updated)
+    }
+
+    pub fn clear_relay(&self) -> Result<DriftSettings, SettingsError> {
+        let mut relay = self.snapshot()?.relay;
+        relay.clear();
+        self.update_relay(relay)
+    }
 }
 
 impl SettingsLoader {
@@ -266,12 +373,26 @@ impl SettingsLoader {
 
         let temporary_path = self.path.with_extension("json.tmp");
         fs::write(&temporary_path, data).map_err(SettingsError::Write)?;
+        set_private_permissions(&temporary_path).map_err(SettingsError::Write)?;
         if let Err(error) = fs::rename(&temporary_path, &self.path) {
             let _ = fs::remove_file(&temporary_path);
             return Err(SettingsError::Write(error));
         }
         Ok(())
     }
+}
+
+fn set_private_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
+    }
+    let _ = path;
+    Ok(())
 }
 
 pub fn default_config_path() -> Result<PathBuf, ConfigPathError> {
@@ -521,6 +642,57 @@ mod tests {
             SettingsLoader::with_path(&path).load(),
             Err(SettingsError::Parse(_))
         ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn settings_store_round_trips_relay_updates_and_clear_atomically() {
+        let directory = temp_directory();
+        let path = directory.join("config.json");
+        let loader = SettingsLoader::with_path(&path);
+        let store = SettingsStore::new(loader.clone(), DriftSettings::default());
+        let relay = RelaySettings {
+            enabled: true,
+            url: Some("https://relay.example.test:443".into()),
+            credential_ref: None,
+        };
+
+        let updated = store.update_relay(relay.clone()).unwrap();
+        assert_eq!(updated.relay, relay);
+        assert_eq!(loader.load().unwrap().settings.relay, relay);
+        assert!(!path.with_extension("json.tmp").exists());
+
+        let cleared = store.clear_relay().unwrap();
+        assert_eq!(cleared.relay, RelaySettings::default());
+        assert_eq!(
+            loader.load().unwrap().settings.relay,
+            RelaySettings::default()
+        );
+        assert!(!path.with_extension("json.tmp").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_store_update_does_not_change_current_snapshot_or_file() {
+        let directory = temp_directory();
+        let path = directory.join("config.json");
+        let loader = SettingsLoader::with_path(&path);
+        let store = SettingsStore::new(loader, DriftSettings::default());
+        let invalid_relay = RelaySettings {
+            enabled: true,
+            url: Some("ftp://relay.example.test".into()),
+            credential_ref: None,
+        };
+
+        assert!(matches!(
+            store.update_relay(invalid_relay),
+            Err(SettingsError::Validation(
+                SettingsValidationError::InvalidRelayUrl
+            ))
+        ));
+        assert_eq!(store.snapshot().unwrap().relay, RelaySettings::default());
+        assert!(!path.exists());
+        assert!(!path.with_extension("json.tmp").exists());
         fs::remove_dir_all(directory).unwrap();
     }
 }
