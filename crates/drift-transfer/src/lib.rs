@@ -7,7 +7,9 @@ use drift_protocol::{
     BackendCapabilities, BackendCapability, BackendError, BackendEvent, ReceiveRequest,
     SendRequest, TransferBackend, TransferHandle,
 };
-use drift_storage::{JsonStore, StorageError};
+use drift_storage::{
+    DestinationError, JsonStore, ReceiveStaging, ReceiveStagingError, StorageError,
+};
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tracing::{debug, warn};
@@ -42,6 +44,7 @@ enum RetryRequest {
     },
     Receive {
         request: ReceiveRequest,
+        staging: ReceiveStaging,
     },
 }
 
@@ -205,7 +208,7 @@ where
             .get(&transfer_id)
             .cloned()
             .ok_or_else(|| E::from(TransferError::RetryNotAllowed(session.state)))?;
-        if let RetryRequest::Receive { request } = request {
+        if let RetryRequest::Receive { request, .. } = request {
             validate_receive(request.output_directory).await?;
         }
         let request = self
@@ -220,8 +223,27 @@ where
                 .start_send_attempt(request, manifest)
                 .await
                 .map_err(E::from),
-            RetryRequest::Receive { request } => {
-                self.start_receive_attempt(request).await.map_err(E::from)
+            RetryRequest::Receive { request, staging } => {
+                let retry_request = RetryRequest::Receive {
+                    request: request.clone(),
+                    staging: staging.clone(),
+                };
+                let result = self.start_receive_attempt(request).await.map_err(E::from);
+                if result.is_ok() {
+                    if let Err(error) = staging.cleanup().await {
+                        warn!(
+                            error = %safe_receive_staging_error(&error),
+                            "failed to clean superseded receive staging"
+                        );
+                    }
+                } else {
+                    self.inner
+                        .retry_requests
+                        .lock()
+                        .await
+                        .insert(transfer_id, retry_request);
+                }
+                result
             }
         };
         if result.is_ok() {
@@ -392,8 +414,16 @@ where
         &self,
         request: ReceiveRequest,
     ) -> Result<TransferId, TransferError> {
+        let staging = ReceiveStaging::create(&request.output_directory)
+            .await
+            .map_err(map_receive_staging_error)?;
         let retry_request = RetryRequest::Receive {
             request: request.clone(),
+            staging: staging.clone(),
+        };
+        let backend_request = ReceiveRequest {
+            output_directory: staging.path().to_path_buf(),
+            ..request.clone()
         };
         let (transfer_id, cancellation) = self
             .create_active_session(
@@ -416,7 +446,7 @@ where
         )
         .await?;
         let handle_result = tokio::select! {
-            result = self.inner.backend.receive(request) => result,
+            result = self.inner.backend.receive(backend_request) => result,
             _ = wait_for_cancellation(cancellation.clone()) => Err(BackendError::Cancelled),
         };
         let mut handle = match handle_result {
@@ -479,7 +509,9 @@ where
                 }
                 RetryRequest::Send { request, manifest }
             }
-            RetryRequest::Receive { request } => RetryRequest::Receive { request },
+            RetryRequest::Receive { request, staging } => {
+                RetryRequest::Receive { request, staging }
+            }
         };
         let (cancellation, cancellation_receiver) = watch::channel(false);
         let (completion, _) = watch::channel(false);
@@ -662,6 +694,7 @@ where
             self.cleanup_attempt(transfer_id, false).await;
             return;
         }
+        let receive_staging = self.receive_staging(transfer_id).await;
         match result {
             Ok(_) => {
                 if let Err(error) = self
@@ -684,6 +717,30 @@ where
                         .await;
                     self.cleanup_attempt(transfer_id, false).await;
                     return;
+                }
+                if let Some(staging) = receive_staging {
+                    match staging.finalize().await {
+                        Ok(report) if report.cleanup_failed() => {
+                            warn!(%transfer_id, "receive staging cleanup failed after publish");
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                %transfer_id,
+                                error = %safe_receive_staging_error(&error),
+                                "receive finalization failed"
+                            );
+                            let _ = self
+                                .fail_with(
+                                    transfer_id,
+                                    safe_receive_staging_error(&error),
+                                    receive_staging_failure_kind(&error),
+                                )
+                                .await;
+                            self.cleanup_attempt(transfer_id, false).await;
+                            return;
+                        }
+                    }
                 }
                 if let Err(error) = self
                     .advance(
@@ -714,7 +771,32 @@ where
         }
     }
 
+    async fn receive_staging(&self, transfer_id: TransferId) -> Option<ReceiveStaging> {
+        self.inner
+            .retry_requests
+            .lock()
+            .await
+            .get(&transfer_id)
+            .and_then(|request| match request {
+                RetryRequest::Receive { staging, .. } => Some(staging.clone()),
+                RetryRequest::Send { .. } => None,
+            })
+    }
+
     async fn cleanup_attempt(&self, transfer_id: TransferId, keep_retry_request: bool) {
+        if !keep_retry_request {
+            let retry_request = self.inner.retry_requests.lock().await.remove(&transfer_id);
+            if let Some(RetryRequest::Receive { staging, .. }) = retry_request {
+                if let Err(error) = staging.cleanup().await {
+                    warn!(
+                        %transfer_id,
+                        error = %safe_receive_staging_error(&error),
+                        "failed to clean receive staging"
+                    );
+                }
+            }
+            self.clear_recovery_metadata(transfer_id).await;
+        }
         let completion = self
             .inner
             .active
@@ -722,10 +804,6 @@ where
             .await
             .remove(&transfer_id)
             .map(|attempt| attempt.completion);
-        if !keep_retry_request {
-            self.inner.retry_requests.lock().await.remove(&transfer_id);
-            self.clear_recovery_metadata(transfer_id).await;
-        }
         if let Some(completion) = completion {
             let _ = completion.send(true);
         }
@@ -775,7 +853,7 @@ where
         let Some(request) = request else {
             return;
         };
-        let (request, manifest, file_id, file_size, file_digest) = match request {
+        let (request, manifest, file_id, file_size, file_digest, temp_file_path) = match request {
             RetryRequest::Send { request, manifest } => {
                 let (file_id, file_size, file_digest) = manifest
                     .as_ref()
@@ -791,9 +869,10 @@ where
                     file_id,
                     file_size,
                     file_digest,
+                    None,
                 )
             }
-            RetryRequest::Receive { request } => (
+            RetryRequest::Receive { request, staging } => (
                 ResumeRequest::Receive {
                     output_directory: request.output_directory,
                 },
@@ -801,6 +880,7 @@ where
                 Uuid::nil(),
                 0,
                 None,
+                Some(staging.relative_path().to_path_buf()),
             ),
         };
         let state = ResumeState {
@@ -827,7 +907,7 @@ where
             file_size,
             completed_chunks: Vec::new(),
             file_digest,
-            temp_file_path: None,
+            temp_file_path,
         };
         if let Err(error) = store.save_resume(&state).await {
             warn!(%transfer_id, error = %safe_storage_error(&error), "failed to persist resume metadata");
@@ -864,14 +944,23 @@ where
         transfer_id: TransferId,
         error: BackendError,
     ) -> Result<TransferId, TransferError> {
-        let message = error.safe_message();
+        self.fail_with(transfer_id, error.safe_message(), error.failure_kind())
+            .await
+    }
+
+    async fn fail_with(
+        &self,
+        transfer_id: TransferId,
+        message: impl Into<String>,
+        failure_kind: TransferFailureKind,
+    ) -> Result<TransferId, TransferError> {
         let mut sessions = self.inner.sessions.write().await;
         let session = sessions
             .get_mut(&transfer_id)
             .ok_or_else(|| TransferError::Backend("transfer session not found".into()))?;
         session.transition(TransferState::Failed)?;
-        session.error = Some(message);
-        session.failure_kind = Some(error.failure_kind());
+        session.error = Some(message.into());
+        session.failure_kind = Some(failure_kind);
         drop(sessions);
         self.emit(transfer_id, TransferEvent::Failed);
         Ok(transfer_id)
@@ -904,6 +993,36 @@ where
 
 fn map_storage_error(error: StorageError) -> TransferError {
     TransferError::Backend(safe_storage_error(&error).into())
+}
+
+fn map_receive_staging_error(error: ReceiveStagingError) -> TransferError {
+    TransferError::Filesystem(safe_receive_staging_error(&error).into())
+}
+
+fn receive_staging_failure_kind(error: &ReceiveStagingError) -> TransferFailureKind {
+    match error {
+        ReceiveStagingError::Destination(DestinationError::SymlinkNotAllowed)
+        | ReceiveStagingError::InvalidOutputPath
+        | ReceiveStagingError::SymlinkOutput => TransferFailureKind::Security,
+        ReceiveStagingError::EmptyOutput => TransferFailureKind::Integrity,
+        ReceiveStagingError::Destination(_)
+        | ReceiveStagingError::Conflict
+        | ReceiveStagingError::Io(_)
+        | ReceiveStagingError::Rollback(_) => TransferFailureKind::Filesystem,
+    }
+}
+
+fn safe_receive_staging_error(error: &ReceiveStagingError) -> &'static str {
+    match error {
+        ReceiveStagingError::Destination(_) => "receive destination is unavailable",
+        ReceiveStagingError::EmptyOutput => "received output was empty",
+        ReceiveStagingError::InvalidOutputPath => "received output path was unsafe",
+        ReceiveStagingError::SymlinkOutput => "received output contained a symbolic link",
+        ReceiveStagingError::Conflict => "received output already exists",
+        ReceiveStagingError::Io(_) | ReceiveStagingError::Rollback(_) => {
+            "receive finalization failed"
+        }
+    }
 }
 
 fn safe_storage_error(error: &StorageError) -> &'static str {
@@ -1375,6 +1494,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn receive_rejects_file_destination_as_filesystem_error() {
+        let root = std::env::temp_dir().join(format!(
+            "drift-transfer-invalid-receive-destination-{}",
+            TransferId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("not-a-directory");
+        std::fs::write(&file, b"existing output").unwrap();
+
+        let error = TransferManager::new(CrocBackend::default())
+            .start_receive(ReceiveRequest::new("receive-code", &file).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TransferError::Filesystem(message) if message == "receive destination is unavailable"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn recovery_uses_explicit_receive_destination() {
@@ -1442,9 +1583,199 @@ mod tests {
         let arguments = std::fs::read_to_string(&arguments_path).unwrap();
         let selected_text = selected_directory.to_string_lossy().into_owned();
         let persisted_text = persisted_directory.to_string_lossy().into_owned();
-        assert!(arguments.lines().any(|argument| argument == selected_text));
-        assert!(!arguments.lines().any(|argument| argument == persisted_text));
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        let output_index = arguments
+            .iter()
+            .position(|argument| *argument == "--out")
+            .unwrap();
+        let backend_output = arguments[output_index + 1];
+        assert!(backend_output.starts_with(&format!("{selected_text}/.drift-staging-")));
+        assert!(!arguments.iter().any(|argument| *argument == persisted_text));
 
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_receive_publishes_only_after_staging_finalization() {
+        let root = std::env::temp_dir().join(format!(
+            "drift-transfer-receive-finalize-{}",
+            TransferId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = versioned_script(
+            r#"output=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--out" ]; then output="$2"; fi
+    shift
+done
+mkdir -p "$output"
+printf 'received output' > "$output/file.txt"
+exit 0"#,
+        );
+        let manager = TransferManager::new(CrocBackend::new(&script));
+        let mut events = manager.subscribe();
+        let transfer_id = manager
+            .start_receive(ReceiveRequest::new("receive-code", &root).unwrap())
+            .await
+            .unwrap();
+
+        loop {
+            let notification = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if notification.transfer_id == transfer_id
+                && notification.event == TransferEvent::Completed
+            {
+                break;
+            }
+        }
+
+        assert_eq!(
+            std::fs::read(root.join("file.txt")).unwrap(),
+            b"received output"
+        );
+        assert!(!std::fs::read_dir(&root)
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".drift-staging-")));
+        assert_eq!(
+            manager.session(transfer_id).await.unwrap().state,
+            TransferState::Completed
+        );
+
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_receive_does_not_publish_partial_final_file() {
+        let root = std::env::temp_dir().join(format!(
+            "drift-transfer-receive-failure-{}",
+            TransferId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = versioned_script(
+            r#"output=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--out" ]; then output="$2"; fi
+    shift
+done
+mkdir -p "$output"
+printf 'partial output' > "$output/file.txt"
+exit 7"#,
+        );
+        let manager = TransferManager::new(CrocBackend::new(&script));
+        let mut events = manager.subscribe();
+        let transfer_id = manager
+            .start_receive(ReceiveRequest::new("receive-code", &root).unwrap())
+            .await
+            .unwrap();
+
+        loop {
+            let notification = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if notification.transfer_id == transfer_id
+                && notification.event == TransferEvent::Failed
+            {
+                break;
+            }
+        }
+        while manager.inner.active.lock().await.contains_key(&transfer_id) {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!root.join("file.txt").exists());
+        assert!(!std::fs::read_dir(&root)
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".drift-staging-")));
+        assert_eq!(
+            manager.session(transfer_id).await.unwrap().failure_kind,
+            Some(TransferFailureKind::ProcessFailure)
+        );
+
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retryable_receive_failure_keeps_private_partial_and_resume_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "drift-transfer-receive-recovery-{}",
+            TransferId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state_root = root.join("state");
+        let script = versioned_script(
+            r#"output=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--out" ]; then output="$2"; fi
+    shift
+done
+mkdir -p "$output"
+    printf 'partial output' > "$output/file.txt"
+    sleep 1"#,
+        );
+        let manager = TransferManager::with_resume_store(
+            CrocBackend::new(&script).with_timeout(std::time::Duration::from_millis(50)),
+            "croc",
+            JsonStore::new(&state_root),
+        );
+        let mut events = manager.subscribe();
+        let transfer_id = manager
+            .start_receive(ReceiveRequest::new("receive-code", &root).unwrap())
+            .await
+            .unwrap();
+
+        loop {
+            let notification = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if notification.transfer_id == transfer_id
+                && notification.event == TransferEvent::Failed
+            {
+                break;
+            }
+        }
+
+        let resume = JsonStore::new(&state_root)
+            .load_resume(transfer_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let staging_name = resume.temp_file_path.unwrap();
+        assert!(!root.join("file.txt").exists());
+        assert!(root.join(&staging_name).join("file.txt").exists());
+        assert_eq!(
+            manager.session(transfer_id).await.unwrap().failure_kind,
+            Some(TransferFailureKind::Network)
+        );
+
+        manager.discard_recovery(transfer_id).await.unwrap();
+        assert!(!root.join(&staging_name).exists());
         let _ = std::fs::remove_file(script);
         let _ = std::fs::remove_dir_all(root);
     }

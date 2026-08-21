@@ -116,6 +116,8 @@ pub enum TransferError {
     ProgressNotAllowed(TransferState),
     #[error("backend error: {0}")]
     Backend(String),
+    #[error("filesystem error: {0}")]
+    Filesystem(String),
     #[error("transfer cancelled")]
     Cancelled,
     #[error("transfer cannot be cancelled in state {0:?}")]

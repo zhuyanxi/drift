@@ -3,6 +3,7 @@ use drift_core::{
     TransferManifest,
 };
 use std::{
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -15,6 +16,7 @@ use thiserror::Error;
 use tokio::fs;
 
 const MAX_SCAN_DIRECTORY_ENTRIES: usize = 1024;
+const RECEIVE_STAGING_PREFIX: &str = ".drift-staging-";
 
 #[derive(Clone, Default)]
 pub struct ScanCancellation {
@@ -375,6 +377,159 @@ pub enum StorageError {
     InvalidResume(#[source] ResumeStateError),
 }
 
+#[derive(Debug, Error)]
+pub enum ReceiveStagingError {
+    #[error("receive destination is invalid")]
+    Destination(#[source] DestinationError),
+    #[error("receive output is empty")]
+    EmptyOutput,
+    #[error("receive output path is invalid")]
+    InvalidOutputPath,
+    #[error("receive output contains a symbolic link")]
+    SymlinkOutput,
+    #[error("receive output conflicts with an existing destination entry")]
+    Conflict,
+    #[error("receive staging I/O failed")]
+    Io(#[source] io::Error),
+    #[error("receive staging rollback failed")]
+    Rollback(#[source] io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveFinalizeReport {
+    cleanup_failed: bool,
+}
+
+impl ReceiveFinalizeReport {
+    pub fn cleanup_failed(self) -> bool {
+        self.cleanup_failed
+    }
+}
+
+#[derive(Clone)]
+pub struct ReceiveStaging {
+    destination: PathBuf,
+    path: PathBuf,
+    relative_path: PathBuf,
+    existing_destination_entries: Vec<OsString>,
+}
+
+impl std::fmt::Debug for ReceiveStaging {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceiveStaging")
+            .field("destination_configured", &true)
+            .field("staging_configured", &true)
+            .finish()
+    }
+}
+
+impl ReceiveStaging {
+    pub async fn create(destination: impl Into<PathBuf>) -> Result<Self, ReceiveStagingError> {
+        let destination = destination.into();
+        validate_receive_directory(&destination)
+            .await
+            .map_err(ReceiveStagingError::Destination)?;
+        fs::create_dir_all(&destination)
+            .await
+            .map_err(ReceiveStagingError::Io)?;
+        validate_destination_components(&destination)
+            .await
+            .map_err(ReceiveStagingError::Destination)?;
+
+        let existing_destination_entries = read_directory_names(&destination)
+            .await
+            .map_err(ReceiveStagingError::Io)?;
+        let relative_path = PathBuf::from(format!(
+            "{RECEIVE_STAGING_PREFIX}{}",
+            TransferId::new()
+        ));
+        let path = destination.join(&relative_path);
+        fs::create_dir(&path)
+            .await
+            .map_err(ReceiveStagingError::Io)?;
+        set_private_directory_permissions(&path)
+            .await
+            .map_err(ReceiveStagingError::Io)?;
+
+        Ok(Self {
+            destination,
+            path,
+            relative_path,
+            existing_destination_entries,
+        })
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub async fn finalize(&self) -> Result<ReceiveFinalizeReport, ReceiveStagingError> {
+        validate_receive_directory(&self.destination)
+            .await
+            .map_err(ReceiveStagingError::Destination)?;
+        validate_staging_root(&self.path).await?;
+        reject_unexpected_destination_entries(
+            &self.destination,
+            &self.relative_path,
+            &self.existing_destination_entries,
+        )
+        .await?;
+
+        let entries = read_directory_entries(&self.path)
+            .await
+            .map_err(ReceiveStagingError::Io)?;
+        if entries.is_empty() {
+            return Err(ReceiveStagingError::EmptyOutput);
+        }
+        for entry in &entries {
+            validate_staged_tree(&entry.path, Path::new(entry.name.as_os_str())).await?;
+            let final_path = self.destination.join(&entry.name);
+            if path_exists(&final_path).await.map_err(ReceiveStagingError::Io)? {
+                return Err(ReceiveStagingError::Conflict);
+            }
+        }
+
+        let mut published = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let final_path = self.destination.join(&entry.name);
+            if let Err(error) = fs::rename(&entry.path, &final_path).await {
+                for (published_path, staged_path) in published.iter().rev() {
+                    if let Err(rollback_error) = fs::rename(published_path, staged_path).await {
+                        return Err(ReceiveStagingError::Rollback(rollback_error));
+                    }
+                }
+                return Err(ReceiveStagingError::Io(error));
+            }
+            published.push((final_path, entry.path));
+        }
+
+        let cleanup_failed = fs::remove_dir(&self.path).await.is_err();
+        Ok(ReceiveFinalizeReport { cleanup_failed })
+    }
+
+    pub async fn cleanup(&self) -> Result<(), ReceiveStagingError> {
+        match fs::symlink_metadata(&self.path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(ReceiveStagingError::SymlinkOutput)
+            }
+            Ok(_) => fs::remove_dir_all(&self.path)
+                .await
+                .map_err(ReceiveStagingError::Io),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ReceiveStagingError::Io(error)),
+        }
+    }
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum DestinationError {
     #[error("destination path must not be empty")]
@@ -385,6 +540,8 @@ pub enum DestinationError {
     NotDirectory,
     #[error("destination path is not writable")]
     NotWritable,
+    #[error("destination path contains a symbolic link")]
+    SymlinkNotAllowed,
 }
 
 pub async fn validate_receive_directory(path: impl AsRef<Path>) -> Result<(), DestinationError> {
@@ -392,9 +549,13 @@ pub async fn validate_receive_directory(path: impl AsRef<Path>) -> Result<(), De
     if path.as_os_str().is_empty() {
         return Err(DestinationError::Empty);
     }
+    validate_destination_components(path).await?;
 
-    let write_probe_directory = match fs::metadata(path).await {
+    let write_probe_directory = match fs::symlink_metadata(path).await {
         Ok(metadata) if metadata.is_dir() => path.to_path_buf(),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(DestinationError::SymlinkNotAllowed)
+        }
         Ok(_) => return Err(DestinationError::NotDirectory),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let parent = path
@@ -425,6 +586,169 @@ pub async fn validate_receive_directory(path: impl AsRef<Path>) -> Result<(), De
                 io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
             ) => Err(DestinationError::NotWritable),
         Err(_) => Err(DestinationError::Unavailable),
+    }
+}
+
+async fn validate_destination_components(path: &Path) -> Result<(), DestinationError> {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(DestinationError::Unavailable);
+    }
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(ancestor).await {
+            Ok(metadata) if metadata.file_type().is_symlink() && ancestor == path => {
+                return Err(DestinationError::SymlinkNotAllowed)
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                match fs::metadata(ancestor).await {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => return Err(DestinationError::Unavailable),
+                    Err(_) => return Err(DestinationError::Unavailable),
+                }
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(if ancestor == path {
+                    DestinationError::NotDirectory
+                } else {
+                    DestinationError::Unavailable
+                })
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(DestinationError::Unavailable),
+        }
+    }
+    Ok(())
+}
+
+struct DirectoryEntry {
+    name: OsString,
+    path: PathBuf,
+}
+
+async fn read_directory_entries(path: &Path) -> io::Result<Vec<DirectoryEntry>> {
+    let mut entries = Vec::new();
+    let mut directory = fs::read_dir(path).await?;
+    while let Some(entry) = directory.next_entry().await? {
+        entries.push(DirectoryEntry {
+            name: entry.file_name(),
+            path: entry.path(),
+        });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
+}
+
+async fn read_directory_names(path: &Path) -> io::Result<Vec<OsString>> {
+    Ok(read_directory_entries(path)
+        .await?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect())
+}
+
+async fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).await?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).await?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+async fn validate_staging_root(path: &Path) -> Result<(), ReceiveStagingError> {
+    let metadata = fs::symlink_metadata(path)
+        .await
+        .map_err(ReceiveStagingError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ReceiveStagingError::SymlinkOutput);
+    }
+    Ok(())
+}
+
+async fn reject_unexpected_destination_entries(
+    destination: &Path,
+    staging_name: &Path,
+    existing_entries: &[OsString],
+) -> Result<(), ReceiveStagingError> {
+    let staging_name = staging_name
+        .file_name()
+        .ok_or(ReceiveStagingError::InvalidOutputPath)?;
+    let current_entries = read_directory_names(destination)
+        .await
+        .map_err(ReceiveStagingError::Io)?;
+    if current_entries.into_iter().any(|entry| {
+        entry != staging_name
+            && !is_receive_staging_name(&entry)
+            && !existing_entries.iter().any(|existing| existing == &entry)
+    }) {
+        return Err(ReceiveStagingError::InvalidOutputPath);
+    }
+    Ok(())
+}
+
+async fn validate_staged_tree(path: &Path, relative_path: &Path) -> Result<(), ReceiveStagingError> {
+    let mut pending = vec![(path.to_path_buf(), relative_path.to_path_buf())];
+    while let Some((path, relative_path)) = pending.pop() {
+        sanitize_relative_path(&relative_path)
+            .map_err(|_| ReceiveStagingError::InvalidOutputPath)?;
+        let metadata = fs::symlink_metadata(&path)
+            .await
+            .map_err(ReceiveStagingError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ReceiveStagingError::SymlinkOutput);
+        }
+        if metadata.is_dir() {
+            let entries = read_directory_entries(&path)
+                .await
+                .map_err(ReceiveStagingError::Io)?;
+            for entry in entries {
+                pending.push((entry.path, relative_path.join(entry.name)));
+            }
+        } else if !metadata.is_file() {
+            return Err(ReceiveStagingError::InvalidOutputPath);
+        }
+    }
+    Ok(())
+}
+
+async fn path_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_receive_staging_path(path: &Path) -> bool {
+    path.components().count() == 1
+        && path
+            .file_name()
+            .is_some_and(is_receive_staging_name)
+}
+
+fn is_receive_staging_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(RECEIVE_STAGING_PREFIX))
+}
+
+async fn remove_owned_partial(path: PathBuf) -> Result<(), StorageError> {
+    match fs::symlink_metadata(&path).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path).await.map_err(StorageError::Io)
+        }
+        Ok(_) => fs::remove_file(path).await.map_err(StorageError::Io),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StorageError::Io(error)),
     }
 }
 
@@ -561,12 +885,15 @@ impl JsonStore {
         };
         if let Some(state) = state {
             if let Some(temp_file_path) = state.temp_file_path {
-                let partial_path = self.root.join(temp_file_path);
-                match fs::remove_file(partial_path).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(StorageError::Io(error)),
-                }
+                let partial_path = match &state.request {
+                    drift_core::ResumeRequest::Receive { output_directory }
+                        if is_receive_staging_path(&temp_file_path)
+                            && validate_destination_components(output_directory)
+                                .await
+                                .is_ok() => output_directory.join(&temp_file_path),
+                    _ => self.root.join(&temp_file_path),
+                };
+                remove_owned_partial(partial_path).await?;
             }
         }
         self.remove_resume(transfer_id).await
@@ -778,6 +1105,157 @@ mod tests {
             Err(DestinationError::Unavailable)
         );
 
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn receive_staging_atomically_publishes_nested_output() {
+        let root = scan_root("receive-finalize");
+        fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("received");
+        let staging = ReceiveStaging::create(&destination).await.unwrap();
+        let nested = staging.path().join("bundle").join("nested");
+        fs::create_dir_all(&nested).await.unwrap();
+        fs::write(nested.join("file.txt"), b"verified output")
+            .await
+            .unwrap();
+
+        let report = staging.finalize().await.unwrap();
+
+        assert!(!report.cleanup_failed());
+        assert_eq!(
+            fs::read(destination.join("bundle").join("nested").join("file.txt"))
+                .await
+                .unwrap(),
+            b"verified output"
+        );
+        assert!(!staging.path().exists());
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn receive_staging_allows_concurrent_private_staging() {
+        let root = scan_root("receive-concurrent");
+        fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("received");
+        let first = ReceiveStaging::create(&destination).await.unwrap();
+        let second = ReceiveStaging::create(&destination).await.unwrap();
+        fs::write(first.path().join("first.txt"), b"first")
+            .await
+            .unwrap();
+
+        first.finalize().await.unwrap();
+
+        assert_eq!(fs::read(destination.join("first.txt")).await.unwrap(), b"first");
+        second.cleanup().await.unwrap();
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn receive_staging_publishes_multiple_top_level_entries() {
+        let root = scan_root("receive-multi-entry");
+        fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("received");
+        let staging = ReceiveStaging::create(&destination).await.unwrap();
+        fs::write(staging.path().join("first.txt"), b"first")
+            .await
+            .unwrap();
+        fs::write(staging.path().join("second.txt"), b"second")
+            .await
+            .unwrap();
+
+        staging.finalize().await.unwrap();
+
+        assert_eq!(fs::read(destination.join("first.txt")).await.unwrap(), b"first");
+        assert_eq!(fs::read(destination.join("second.txt")).await.unwrap(), b"second");
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn receive_staging_refuses_existing_output_without_overwrite() {
+        let root = scan_root("receive-conflict");
+        fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("received");
+        fs::create_dir_all(&destination).await.unwrap();
+        fs::write(destination.join("file.txt"), b"user output")
+            .await
+            .unwrap();
+        let staging = ReceiveStaging::create(&destination).await.unwrap();
+        fs::write(staging.path().join("file.txt"), b"incoming output")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            staging.finalize().await,
+            Err(ReceiveStagingError::Conflict)
+        ));
+        assert_eq!(
+            fs::read(destination.join("file.txt")).await.unwrap(),
+            b"user output"
+        );
+        staging.cleanup().await.unwrap();
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn receive_staging_rejects_new_destination_output_outside_staging() {
+        let root = scan_root("receive-containment");
+        fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("received");
+        let staging = ReceiveStaging::create(&destination).await.unwrap();
+        fs::write(destination.join("escape.txt"), b"unexpected")
+            .await
+            .unwrap();
+        fs::write(staging.path().join("file.txt"), b"incoming")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            staging.finalize().await,
+            Err(ReceiveStagingError::InvalidOutputPath)
+        ));
+        assert!(destination.join("escape.txt").exists());
+        staging.cleanup().await.unwrap();
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receive_staging_rejects_symlink_output() {
+        use std::os::unix::fs::symlink;
+
+        let root = scan_root("receive-symlink");
+        fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("received");
+        let outside = root.join("outside.txt");
+        fs::write(&outside, b"outside").await.unwrap();
+        let staging = ReceiveStaging::create(&destination).await.unwrap();
+        symlink(&outside, staging.path().join("escape.txt")).unwrap();
+
+        assert!(matches!(
+            staging.finalize().await,
+            Err(ReceiveStagingError::SymlinkOutput)
+        ));
+        assert_eq!(fs::read(&outside).await.unwrap(), b"outside");
+        staging.cleanup().await.unwrap();
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receive_destination_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = scan_root("receive-destination-symlink");
+        let actual = root.join("actual");
+        let selected = root.join("selected");
+        fs::create_dir_all(&actual).await.unwrap();
+        symlink(&actual, &selected).unwrap();
+
+        assert_eq!(
+            validate_receive_directory(&selected).await,
+            Err(DestinationError::SymlinkNotAllowed)
+        );
         let _ = fs::remove_dir_all(root).await;
     }
 

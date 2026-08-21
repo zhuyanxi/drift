@@ -365,6 +365,9 @@ impl AppCommandError {
             Self::Transfer(TransferError::CapabilityUnavailable(TransferCapability::Resume)) => {
                 "Resume is unavailable for this backend."
             }
+            Self::Transfer(TransferError::Filesystem(_)) => {
+                "The received files could not be finalized."
+            }
             Self::Transfer(_) => "The transfer could not start.",
             Self::RecoveryUnavailable | Self::RecoveryInvalid => {
                 "The transfer recovery is no longer available."
@@ -390,6 +393,7 @@ impl From<DestinationError> for AppCommandError {
                 Self::OutputDirectoryUnavailable
             }
             DestinationError::NotWritable => Self::OutputDirectoryNotWritable,
+            DestinationError::SymlinkNotAllowed => Self::OutputDirectoryUnavailable,
         }
     }
 }

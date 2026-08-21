@@ -17,6 +17,6 @@ Drift does not expose byte-level pause/resume for Croc 11.2.x. Drift exposes saf
 - TransferManager returns `CapabilityUnavailable` for pause/resume instead of changing lifecycle state or killing a process.
 - Drift never labels a Croc transfer `Paused` or `Resuming` based on guessed signals.
 - Recoverable interruption persists versioned, secret-free metadata. Recovery requires explicit user action and starts a fresh Croc attempt after source/destination validation.
-- Croc recovery metadata records no Drift-owned staging path. Discard removes Drift metadata and only explicitly owned staging files; it does not claim ownership or cleanup of Croc partial output.
+- Receive recovery metadata records only the relative name of Drift-owned hidden staging output. Discard revalidates the destination and removes that owned staging tree; it does not delete unrelated destination entries.
 - Receiver recovery may use a newly selected, validated destination; persisted destination remains fallback when no replacement is supplied.
 - Native byte-level resume remains outside this story until Croc behavior is verified on macOS and Linux with an executable peer transfer.
