@@ -1439,6 +1439,7 @@ name = "drift-storage"
 version = "0.1.0"
 dependencies = [
  "drift-core",
+ "libc",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

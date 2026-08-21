@@ -247,7 +247,7 @@ where
             }
         };
         if result.is_ok() {
-            self.clear_recovery_metadata(transfer_id).await;
+            self.remove_recovery_metadata(transfer_id).await;
         }
         result
     }
@@ -299,7 +299,7 @@ where
             }
         };
         if result.is_ok() {
-            self.clear_recovery_metadata(old_transfer_id).await;
+            self.discard_recovery_data(old_transfer_id).await;
         }
         result
     }
@@ -314,7 +314,15 @@ where
             .map_err(map_storage_error)
     }
 
-    async fn clear_recovery_metadata(&self, transfer_id: TransferId) {
+    async fn remove_recovery_metadata(&self, transfer_id: TransferId) {
+        if let Some(store) = &self.inner.resume_store {
+            if let Err(error) = store.remove_resume(transfer_id).await {
+                warn!(%transfer_id, error = %safe_storage_error(&error), "failed to clear recovery metadata");
+            }
+        }
+    }
+
+    async fn discard_recovery_data(&self, transfer_id: TransferId) {
         if let Some(store) = &self.inner.resume_store {
             if let Err(error) = store.discard_resume(transfer_id).await {
                 warn!(%transfer_id, error = %safe_storage_error(&error), "failed to clear recovery metadata");
@@ -416,7 +424,7 @@ where
     ) -> Result<TransferId, TransferError> {
         let staging = ReceiveStaging::create(&request.output_directory)
             .await
-            .map_err(map_receive_staging_error)?;
+            .map_err(map_receive_staging_creation_error)?;
         let retry_request = RetryRequest::Receive {
             request: request.clone(),
             staging: staging.clone(),
@@ -439,12 +447,30 @@ where
                 .await;
             return Ok(transfer_id);
         }
-        self.advance(
-            transfer_id,
-            TransferState::Connecting,
-            TransferEvent::Connecting,
-        )
-        .await?;
+        if self
+            .advance(
+                transfer_id,
+                TransferState::Connecting,
+                TransferEvent::Connecting,
+            )
+            .await
+            .is_err()
+        {
+            warn!(%transfer_id, "failed to start receive transfer");
+            if self
+                .fail_with(
+                    transfer_id,
+                    "receive could not start",
+                    TransferFailureKind::Unknown,
+                )
+                .await
+                .is_err()
+            {
+                warn!(%transfer_id, "failed to record receive startup failure");
+            }
+            self.cleanup_attempt(transfer_id, false).await;
+            return Ok(transfer_id);
+        }
         let handle_result = tokio::select! {
             result = self.inner.backend.receive(backend_request) => result,
             _ = wait_for_cancellation(cancellation.clone()) => Err(BackendError::Cancelled),
@@ -795,7 +821,7 @@ where
                     );
                 }
             }
-            self.clear_recovery_metadata(transfer_id).await;
+            self.remove_recovery_metadata(transfer_id).await;
         }
         let completion = self
             .inner
@@ -995,8 +1021,12 @@ fn map_storage_error(error: StorageError) -> TransferError {
     TransferError::Backend(safe_storage_error(&error).into())
 }
 
-fn map_receive_staging_error(error: ReceiveStagingError) -> TransferError {
-    TransferError::Filesystem(safe_receive_staging_error(&error).into())
+fn map_receive_staging_creation_error(error: ReceiveStagingError) -> TransferError {
+    let message = match &error {
+        ReceiveStagingError::Io(_) => "receive staging is unavailable",
+        _ => safe_receive_staging_error(&error),
+    };
+    TransferError::Filesystem(message.into())
 }
 
 fn receive_staging_failure_kind(error: &ReceiveStagingError) -> TransferFailureKind {
@@ -1006,6 +1036,7 @@ fn receive_staging_failure_kind(error: &ReceiveStagingError) -> TransferFailureK
         | ReceiveStagingError::SymlinkOutput => TransferFailureKind::Security,
         ReceiveStagingError::EmptyOutput => TransferFailureKind::Integrity,
         ReceiveStagingError::Destination(_)
+        | ReceiveStagingError::DestinationChanged
         | ReceiveStagingError::Conflict
         | ReceiveStagingError::Io(_)
         | ReceiveStagingError::Rollback(_) => TransferFailureKind::Filesystem,
@@ -1015,6 +1046,7 @@ fn receive_staging_failure_kind(error: &ReceiveStagingError) -> TransferFailureK
 fn safe_receive_staging_error(error: &ReceiveStagingError) -> &'static str {
     match error {
         ReceiveStagingError::Destination(_) => "receive destination is unavailable",
+        ReceiveStagingError::DestinationChanged => "receive destination changed during transfer",
         ReceiveStagingError::EmptyOutput => "received output was empty",
         ReceiveStagingError::InvalidOutputPath => "received output path was unsafe",
         ReceiveStagingError::SymlinkOutput => "received output contained a symbolic link",

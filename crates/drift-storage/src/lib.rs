@@ -381,6 +381,8 @@ pub enum StorageError {
 pub enum ReceiveStagingError {
     #[error("receive destination is invalid")]
     Destination(#[source] DestinationError),
+    #[error("receive destination changed during transfer")]
+    DestinationChanged,
     #[error("receive output is empty")]
     EmptyOutput,
     #[error("receive output path is invalid")]
@@ -472,6 +474,11 @@ impl ReceiveStaging {
         &self.relative_path
     }
 
+    /// Publishes verified staged output without replacing existing destination entries.
+    ///
+    /// Each top-level entry is published independently. If a later entry fails, earlier
+    /// entries are rolled back on a best-effort basis because filesystems provide no
+    /// group transaction for multiple paths.
     pub async fn finalize(&self) -> Result<ReceiveFinalizeReport, ReceiveStagingError> {
         validate_receive_directory(&self.destination)
             .await
@@ -492,22 +499,20 @@ impl ReceiveStaging {
         }
         for entry in &entries {
             validate_staged_tree(&entry.path, Path::new(entry.name.as_os_str())).await?;
-            let final_path = self.destination.join(&entry.name);
-            if path_exists(&final_path).await.map_err(ReceiveStagingError::Io)? {
-                return Err(ReceiveStagingError::Conflict);
-            }
         }
 
         let mut published = Vec::with_capacity(entries.len());
         for entry in entries {
             let final_path = self.destination.join(&entry.name);
-            if let Err(error) = fs::rename(&entry.path, &final_path).await {
-                for (published_path, staged_path) in published.iter().rev() {
-                    if let Err(rollback_error) = fs::rename(published_path, staged_path).await {
-                        return Err(ReceiveStagingError::Rollback(rollback_error));
-                    }
-                }
-                return Err(ReceiveStagingError::Io(error));
+            if let Err(error) =
+                rename_without_replacing(entry.path.clone(), final_path.clone()).await
+            {
+                rollback_published(&published).await?;
+                return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                    ReceiveStagingError::Conflict
+                } else {
+                    ReceiveStagingError::Io(error)
+                });
             }
             published.push((final_path, entry.path));
         }
@@ -544,6 +549,10 @@ pub enum DestinationError {
     SymlinkNotAllowed,
 }
 
+/// Validates that a receive destination exists or can be created and is writable.
+///
+/// Existing ancestor symlinks resolving to directories are allowed for standard paths
+/// such as macOS `/var`; the selected destination itself must not be a symlink.
 pub async fn validate_receive_directory(path: impl AsRef<Path>) -> Result<(), DestinationError> {
     let path = path.as_ref();
     if path.as_os_str().is_empty() {
@@ -691,7 +700,7 @@ async fn reject_unexpected_destination_entries(
             && !is_receive_staging_name(&entry)
             && !existing_entries.iter().any(|existing| existing == &entry)
     }) {
-        return Err(ReceiveStagingError::InvalidOutputPath);
+        return Err(ReceiveStagingError::DestinationChanged);
     }
     Ok(())
 }
@@ -721,12 +730,76 @@ async fn validate_staged_tree(path: &Path, relative_path: &Path) -> Result<(), R
     Ok(())
 }
 
-async fn path_exists(path: &Path) -> io::Result<bool> {
-    match fs::symlink_metadata(path).await {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
+async fn rollback_published(
+    published: &[(PathBuf, PathBuf)],
+) -> Result<(), ReceiveStagingError> {
+    for (published_path, staged_path) in published.iter().rev() {
+        if let Err(error) =
+            rename_without_replacing(published_path.clone(), staged_path.clone()).await
+        {
+            return Err(ReceiveStagingError::Rollback(error));
+        }
     }
+    Ok(())
+}
+
+async fn rename_without_replacing(source: PathBuf, destination: PathBuf) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || rename_without_replacing_sync(&source, &destination))
+        .await
+        .map_err(|_| io::Error::other("exclusive rename task failed"))?
+}
+
+fn rename_without_replacing_sync(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let source = path_to_c_string(source)?;
+        let destination = path_to_c_string(destination)?;
+        let result = unsafe {
+            libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL)
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let source = path_to_c_string(source)?;
+        let destination = path_to_c_string(destination)?;
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exclusive rename unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn path_to_c_string(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
 }
 
 fn is_receive_staging_path(path: &Path) -> bool {
@@ -1212,9 +1285,71 @@ mod tests {
 
         assert!(matches!(
             staging.finalize().await,
-            Err(ReceiveStagingError::InvalidOutputPath)
+            Err(ReceiveStagingError::DestinationChanged)
         ));
         assert!(destination.join("escape.txt").exists());
+        staging.cleanup().await.unwrap();
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn receive_staging_rolls_back_when_late_conflict_is_found() {
+        let root = scan_root("receive-late-conflict");
+        fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("received");
+        fs::create_dir_all(&destination).await.unwrap();
+        fs::write(destination.join("second.txt"), b"user output")
+            .await
+            .unwrap();
+        let staging = ReceiveStaging::create(&destination).await.unwrap();
+        fs::write(staging.path().join("first.txt"), b"incoming first")
+            .await
+            .unwrap();
+        fs::write(staging.path().join("second.txt"), b"incoming second")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            staging.finalize().await,
+            Err(ReceiveStagingError::Conflict)
+        ));
+        assert!(!destination.join("first.txt").exists());
+        assert_eq!(
+            fs::read(destination.join("second.txt")).await.unwrap(),
+            b"user output"
+        );
+        assert!(staging.path().join("first.txt").exists());
+        staging.cleanup().await.unwrap();
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receive_staging_does_not_replace_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = scan_root("receive-symlink-conflict");
+        fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("received");
+        let outside = root.join("outside.txt");
+        fs::write(&outside, b"user output").await.unwrap();
+        fs::create_dir_all(&destination).await.unwrap();
+        symlink(&outside, destination.join("file.txt")).unwrap();
+        let staging = ReceiveStaging::create(&destination).await.unwrap();
+        fs::write(staging.path().join("file.txt"), b"incoming output")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            staging.finalize().await,
+            Err(ReceiveStagingError::Conflict)
+        ));
+        assert!(fs::symlink_metadata(destination.join("file.txt"))
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&outside).await.unwrap(), b"user output");
         staging.cleanup().await.unwrap();
         let _ = fs::remove_dir_all(root).await;
     }
