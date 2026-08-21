@@ -122,11 +122,15 @@ pub enum TransferError {
     CancelNotAllowed(TransferState),
     #[error("transfer cannot be retried in state {0:?}")]
     RetryNotAllowed(TransferState),
+    #[error("transfer capability unavailable: {0:?}")]
+    CapabilityUnavailable(TransferCapability),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferCapability {
     Progress,
+    Pause,
+    Resume,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

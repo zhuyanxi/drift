@@ -1,7 +1,8 @@
 target/
 .DS_Store
 
-docs/
+docs/*
+!docs/03-p1-08-croc-compatibility.md
 
 # ============================================================
 # Drift

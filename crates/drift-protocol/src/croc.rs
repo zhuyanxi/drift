@@ -1,5 +1,6 @@
 use crate::{
-    BackendCapability, BackendError, BackendEvent, ReceiveRequest, SendRequest, TransferBackend,
+    BackendCapabilities, BackendCapability, BackendError, BackendEvent, ReceiveRequest,
+    SendRequest, TransferBackend,
 };
 use async_trait::async_trait;
 use std::{
@@ -377,6 +378,14 @@ async fn terminate_child(child: &mut Child) {
 
 #[async_trait]
 impl TransferBackend for CrocBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::new(false, false, false)
+    }
+
+    fn version(&self) -> Option<&'static str> {
+        Some(SUPPORTED_CROC_VERSION_RANGE)
+    }
+
     async fn send(&self, request: SendRequest) -> Result<TransferHandle, BackendError> {
         let args = self.send_args(&request)?;
         self.preflight().await?;

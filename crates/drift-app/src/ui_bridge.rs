@@ -1,11 +1,14 @@
 use crate::event_bridge::AppTransferUpdate;
 use crate::{AppCommand, AppCommandError, AppHandle};
-use drift_core::{Role, TransferCapability, TransferEvent, TransferId, TransferManifest};
+use drift_core::{
+    ResumeRequest, Role, TransferCapability, TransferEvent, TransferId, TransferManifest,
+};
 use drift_storage::{scan_send_paths, ScanCancellation, SourceScan, SourceScanError};
 use drift_ui::{
     ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture, ReceiveEventStream,
-    ReceiveFuture, SelectedItem, SendCommandError, SendCommandErrorKind, SendController, SendEvent,
-    SendEventFuture, SendEventStream, SendFuture, SendProgress, SendSelection,
+    ReceiveFuture, RecoveryCandidate, RecoveryKind, SelectedItem, SendCommandError,
+    SendCommandErrorKind, SendController, SendEvent, SendEventFuture, SendEventStream, SendFuture,
+    SendProgress, SendSelection,
 };
 use std::{
     future::Future,
@@ -31,6 +34,16 @@ impl AppSendController {
 }
 
 impl SendController for AppSendController {
+    fn recoveries(&self) -> SendFuture<Result<Vec<RecoveryCandidate>, SendCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle.recoveries().await {
+                Ok(Ok(discovery)) => Ok(recovery_candidates(&discovery)),
+                Ok(Err(_)) | Err(_) => Err(SendCommandError::start_failed()),
+            }
+        })
+    }
+
     fn scan(&self, paths: Vec<PathBuf>) -> SendFuture<Result<SendSelection, SendCommandError>> {
         let cancellation = ScanCancellation::new();
         if let Ok(mut current) = self.scan_cancellation.lock() {
@@ -110,6 +123,38 @@ impl SendController for AppSendController {
         })
     }
 
+    fn recover(&self, transfer_id: TransferId) -> SendFuture<Result<TransferId, SendCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle
+                .dispatch(AppCommand::RecoverTransfer {
+                    transfer_id,
+                    code: None,
+                })
+                .await
+            {
+                Ok(Ok(transfer_id)) => Ok(transfer_id),
+                Ok(Err(_)) | Err(_) => Err(SendCommandError::start_failed()),
+            }
+        })
+    }
+
+    fn discard_recovery(
+        &self,
+        transfer_id: TransferId,
+    ) -> SendFuture<Result<(), SendCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle
+                .dispatch(AppCommand::DiscardRecovery { transfer_id })
+                .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(_)) | Err(_) => Err(SendCommandError::start_failed()),
+            }
+        })
+    }
+
     fn subscribe(&self) -> Box<dyn SendEventStream> {
         Box::new(AppSendEventStream {
             handle: self.handle.clone(),
@@ -159,6 +204,16 @@ impl AppReceiveController {
 }
 
 impl ReceiveController for AppReceiveController {
+    fn recoveries(&self) -> ReceiveFuture<Result<Vec<RecoveryCandidate>, ReceiveCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle.recoveries().await {
+                Ok(Ok(discovery)) => Ok(recovery_candidates(&discovery)),
+                Ok(Err(_)) | Err(_) => Err(ReceiveCommandError::start_failed()),
+            }
+        })
+    }
+
     fn default_destination(&self) -> Option<PathBuf> {
         Some(self.handle.default_receive_directory())
     }
@@ -233,6 +288,42 @@ impl ReceiveController for AppReceiveController {
         })
     }
 
+    fn recover(
+        &self,
+        transfer_id: TransferId,
+        code: String,
+    ) -> ReceiveFuture<Result<TransferId, ReceiveCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle
+                .dispatch(AppCommand::RecoverTransfer {
+                    transfer_id,
+                    code: Some(code),
+                })
+                .await
+            {
+                Ok(Ok(transfer_id)) => Ok(transfer_id),
+                Ok(Err(_)) | Err(_) => Err(ReceiveCommandError::start_failed()),
+            }
+        })
+    }
+
+    fn discard_recovery(
+        &self,
+        transfer_id: TransferId,
+    ) -> ReceiveFuture<Result<(), ReceiveCommandError>> {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle
+                .dispatch(AppCommand::DiscardRecovery { transfer_id })
+                .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(_)) | Err(_) => Err(ReceiveCommandError::start_failed()),
+            }
+        })
+    }
+
     fn subscribe(&self) -> Box<dyn ReceiveEventStream> {
         Box::new(AppReceiveEventStream {
             handle: self.handle.clone(),
@@ -251,6 +342,20 @@ fn map_destination_error(error: &AppCommandError) -> ReceiveCommandError {
         }
         _ => ReceiveCommandError::destination_unavailable(),
     }
+}
+
+fn recovery_candidates(discovery: &drift_storage::ResumeDiscovery) -> Vec<RecoveryCandidate> {
+    discovery
+        .recoverable()
+        .iter()
+        .map(|state| RecoveryCandidate {
+            transfer_id: state.transfer_id,
+            kind: match state.request {
+                ResumeRequest::Send { .. } => RecoveryKind::Send,
+                ResumeRequest::Receive { .. } => RecoveryKind::Receive,
+            },
+        })
+        .collect()
 }
 
 struct AppSendEventStream {
@@ -340,14 +445,15 @@ fn map_notification(
                     speed_bps,
                 },
             },
-            TransferEvent::CapabilityUnavailable { capability } => {
-                SendEvent::CapabilityUnavailable {
-                    transfer_id,
-                    capability: match capability {
-                        TransferCapability::Progress => TransferCapability::Progress,
-                    },
-                }
-            }
+            TransferEvent::CapabilityUnavailable {
+                capability: TransferCapability::Progress,
+            } => SendEvent::CapabilityUnavailable {
+                transfer_id,
+                capability: TransferCapability::Progress,
+            },
+            TransferEvent::CapabilityUnavailable {
+                capability: TransferCapability::Pause | TransferCapability::Resume,
+            } => return None,
             TransferEvent::Verifying => SendEvent::Verifying { transfer_id },
             TransferEvent::Completed => SendEvent::Completed { transfer_id },
             TransferEvent::Failed => SendEvent::Failed {
@@ -396,14 +502,15 @@ fn map_receive_notification(
                 total,
                 speed_bps,
             },
-            TransferEvent::CapabilityUnavailable { capability } => {
-                ReceiveEvent::CapabilityUnavailable {
-                    transfer_id,
-                    capability: match capability {
-                        TransferCapability::Progress => TransferCapability::Progress,
-                    },
-                }
-            }
+            TransferEvent::CapabilityUnavailable {
+                capability: TransferCapability::Progress,
+            } => ReceiveEvent::CapabilityUnavailable {
+                transfer_id,
+                capability: TransferCapability::Progress,
+            },
+            TransferEvent::CapabilityUnavailable {
+                capability: TransferCapability::Pause | TransferCapability::Resume,
+            } => return None,
             TransferEvent::Verifying => ReceiveEvent::Verifying { transfer_id },
             TransferEvent::Completed => ReceiveEvent::Completed { transfer_id },
             TransferEvent::Failed => ReceiveEvent::Failed {

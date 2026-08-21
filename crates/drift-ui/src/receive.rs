@@ -2,6 +2,8 @@ use crate::progress::{accept_progress, eta_seconds};
 use drift_core::{Progress, TransferCapability, TransferId};
 use std::{fmt, future::Future, path::PathBuf, pin::Pin};
 
+use crate::RecoveryCandidate;
+
 pub type ReceiveFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub type ReceiveEventFuture<'a> =
@@ -12,6 +14,10 @@ pub trait ReceiveEventStream: Send {
 }
 
 pub trait ReceiveController: Send + Sync {
+    fn recoveries(&self) -> ReceiveFuture<Result<Vec<RecoveryCandidate>, ReceiveCommandError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn default_destination(&self) -> Option<PathBuf> {
         None
     }
@@ -37,8 +43,23 @@ pub trait ReceiveController: Send + Sync {
 
     fn retry(
         &self,
-        transfer_id: TransferId,
+        _transfer_id: TransferId,
     ) -> ReceiveFuture<Result<TransferId, ReceiveCommandError>>;
+
+    fn recover(
+        &self,
+        _transfer_id: TransferId,
+        _code: String,
+    ) -> ReceiveFuture<Result<TransferId, ReceiveCommandError>> {
+        Box::pin(async { Err(ReceiveCommandError::start_failed()) })
+    }
+
+    fn discard_recovery(
+        &self,
+        _transfer_id: TransferId,
+    ) -> ReceiveFuture<Result<(), ReceiveCommandError>> {
+        Box::pin(async { Err(ReceiveCommandError::start_failed()) })
+    }
 
     fn subscribe(&self) -> Box<dyn ReceiveEventStream>;
 }
@@ -181,6 +202,8 @@ pub enum ReceiveAction {
     Preflight,
     Start,
     Cancel,
+    Recover { transfer_id: TransferId },
+    DiscardRecovery { transfer_id: TransferId },
 }
 
 impl fmt::Debug for ReceiveAction {
@@ -194,6 +217,14 @@ impl fmt::Debug for ReceiveAction {
             Self::Preflight => formatter.write_str("Preflight"),
             Self::Start => formatter.write_str("Start"),
             Self::Cancel => formatter.write_str("Cancel"),
+            Self::Recover { transfer_id } => formatter
+                .debug_struct("Recover")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::DiscardRecovery { transfer_id } => formatter
+                .debug_struct("DiscardRecovery")
+                .field("transfer_id", transfer_id)
+                .finish(),
         }
     }
 }
@@ -216,6 +247,14 @@ pub enum ReceiveIntent {
         transfer_id: TransferId,
     },
     Retry {
+        transfer_id: TransferId,
+    },
+    Recover {
+        transfer_id: TransferId,
+        code: String,
+        destination: PathBuf,
+    },
+    DiscardRecovery {
         transfer_id: TransferId,
     },
 }
@@ -244,6 +283,16 @@ impl fmt::Debug for ReceiveIntent {
                 .finish(),
             Self::Retry { transfer_id } => formatter
                 .debug_struct("Retry")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::Recover { transfer_id, .. } => formatter
+                .debug_struct("Recover")
+                .field("transfer_id", transfer_id)
+                .field("code", &"[REDACTED]")
+                .field("destination_configured", &true)
+                .finish(),
+            Self::DiscardRecovery { transfer_id } => formatter
+                .debug_struct("DiscardRecovery")
                 .field("transfer_id", transfer_id)
                 .finish(),
         }
@@ -483,6 +532,16 @@ impl ReceiveViewState {
         self.phase == ReceivePhase::Failed && self.retryable && self.retry_transfer_id.is_some()
     }
 
+    pub fn recovery_enabled(&self) -> bool {
+        self.inputs_valid()
+            && matches!(
+                self.phase,
+                ReceivePhase::AwaitingPreflight
+                    | ReceivePhase::Ready
+                    | ReceivePhase::Failed
+            )
+    }
+
     pub fn destination_validation_intent(&self) -> Option<ReceiveIntent> {
         self.destination.as_ref().map(|path| ReceiveIntent::ValidateDestination {
             generation: self.destination_generation,
@@ -610,6 +669,24 @@ impl ReceiveViewState {
                     code: self.code.clone(),
                     destination,
                 })
+            }
+            ReceiveAction::Recover { transfer_id } if self.recovery_enabled() => {
+                let destination = self.destination.clone()?;
+                self.phase = ReceivePhase::Starting;
+                self.progress = None;
+                self.progress_available = true;
+                self.error = None;
+                self.failure = None;
+                Some(ReceiveIntent::Recover {
+                    transfer_id,
+                    code: self.code.clone(),
+                    destination,
+                })
+            }
+            ReceiveAction::DiscardRecovery { transfer_id }
+                if self.active_transfer_id.is_none() =>
+            {
+                Some(ReceiveIntent::DiscardRecovery { transfer_id })
             }
             ReceiveAction::Cancel if self.cancel_enabled() => {
                 let transfer_id = self.active_transfer_id?;
@@ -766,6 +843,10 @@ impl ReceiveViewState {
                     self.progress_available = false;
                 }
             }
+            ReceiveEvent::CapabilityUnavailable {
+                capability: TransferCapability::Pause | TransferCapability::Resume,
+                ..
+            } => {}
             ReceiveEvent::Verifying { transfer_id } => {
                 if self.accepts_transfer(transfer_id) {
                     self.phase = ReceivePhase::Verifying;
@@ -1076,5 +1157,24 @@ mod tests {
         assert!(state.code_input_enabled());
         state.set_code("replacement-code");
         assert_eq!(state.code(), "replacement-code");
+    }
+
+    #[test]
+    fn recovery_requires_validated_inputs_and_binds_new_attempt() {
+        let mut state = ready_state();
+        let old_transfer_id = TransferId::new();
+        assert!(state.recovery_enabled());
+        assert!(matches!(
+            state.handle_action(ReceiveAction::Recover {
+                transfer_id: old_transfer_id,
+            }),
+            Some(ReceiveIntent::Recover { transfer_id, .. }) if transfer_id == old_transfer_id
+        ));
+        let new_transfer_id = TransferId::new();
+        state.apply_event(ReceiveEvent::Created {
+            transfer_id: new_transfer_id,
+        });
+        assert_eq!(state.active_transfer_id(), Some(new_transfer_id));
+        assert_eq!(state.code(), "transfer-code");
     }
 }

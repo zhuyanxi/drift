@@ -2,6 +2,8 @@ use crate::progress::{accept_progress, eta_seconds};
 use drift_core::{Progress, TransferCapability, TransferId, TransferManifest};
 use std::{fmt, future::Future, path::PathBuf, pin::Pin};
 
+use crate::RecoveryCandidate;
+
 pub type SendFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub type SendEventFuture<'a> = Pin<Box<dyn Future<Output = Option<SendEvent>> + Send + 'a>>;
@@ -11,6 +13,10 @@ pub trait SendEventStream: Send {
 }
 
 pub trait SendController: Send + Sync {
+    fn recoveries(&self) -> SendFuture<Result<Vec<RecoveryCandidate>, SendCommandError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn choose(&self) -> SendFuture<Result<SendSelection, SendCommandError>> {
         Box::pin(async { Err(SendCommandError::selection_unavailable()) })
     }
@@ -32,6 +38,17 @@ pub trait SendController: Send + Sync {
     fn cancel(&self, transfer_id: TransferId) -> SendFuture<Result<(), SendCommandError>>;
 
     fn retry(&self, transfer_id: TransferId) -> SendFuture<Result<TransferId, SendCommandError>>;
+
+    fn recover(&self, _transfer_id: TransferId) -> SendFuture<Result<TransferId, SendCommandError>> {
+        Box::pin(async { Err(SendCommandError::start_failed()) })
+    }
+
+    fn discard_recovery(
+        &self,
+        _transfer_id: TransferId,
+    ) -> SendFuture<Result<(), SendCommandError>> {
+        Box::pin(async { Err(SendCommandError::start_failed()) })
+    }
 
     fn subscribe(&self) -> Box<dyn SendEventStream>;
 }
@@ -272,6 +289,8 @@ pub enum SendAction {
     Start,
     CopyCode,
     Cancel,
+    Recover { transfer_id: TransferId },
+    DiscardRecovery { transfer_id: TransferId },
 }
 
 impl fmt::Debug for SendAction {
@@ -286,6 +305,14 @@ impl fmt::Debug for SendAction {
             Self::Start => formatter.write_str("Start"),
             Self::CopyCode => formatter.write_str("CopyCode"),
             Self::Cancel => formatter.write_str("Cancel"),
+            Self::Recover { transfer_id } => formatter
+                .debug_struct("Recover")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::DiscardRecovery { transfer_id } => formatter
+                .debug_struct("DiscardRecovery")
+                .field("transfer_id", transfer_id)
+                .finish(),
         }
     }
 }
@@ -309,6 +336,12 @@ pub enum SendIntent {
         transfer_id: TransferId,
     },
     Retry {
+        transfer_id: TransferId,
+    },
+    Recover {
+        transfer_id: TransferId,
+    },
+    DiscardRecovery {
         transfer_id: TransferId,
     },
 }
@@ -337,6 +370,14 @@ impl fmt::Debug for SendIntent {
                 .finish(),
             Self::Retry { transfer_id } => formatter
                 .debug_struct("Retry")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::Recover { transfer_id } => formatter
+                .debug_struct("Recover")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::DiscardRecovery { transfer_id } => formatter
+                .debug_struct("DiscardRecovery")
                 .field("transfer_id", transfer_id)
                 .finish(),
         }
@@ -646,6 +687,11 @@ impl SendViewState {
         self.phase == SendPhase::Failed && self.retryable && self.retry_transfer_id.is_some()
     }
 
+    pub fn recovery_enabled(&self) -> bool {
+        self.active_transfer_id.is_none()
+            && matches!(self.phase, SendPhase::Empty | SendPhase::Ready | SendPhase::Failed)
+    }
+
     pub fn start_enabled(&self) -> bool {
         (matches!(self.phase, SendPhase::Ready)
             && self
@@ -841,6 +887,15 @@ impl SendViewState {
                     .and_then(|selection| selection.manifest().cloned());
                 Some(SendIntent::Start { paths, manifest })
             }
+            SendAction::Recover { transfer_id } if self.recovery_enabled() => {
+                self.phase = SendPhase::Starting;
+                self.error = None;
+                self.progress = None;
+                Some(SendIntent::Recover { transfer_id })
+            }
+            SendAction::DiscardRecovery { transfer_id } if self.active_transfer_id.is_none() => {
+                Some(SendIntent::DiscardRecovery { transfer_id })
+            }
             SendAction::CopyCode
                 if matches!(self.phase, SendPhase::CodeReady | SendPhase::Transferring) =>
             {
@@ -1013,6 +1068,10 @@ impl SendViewState {
                     self.progress_available = false;
                 }
             }
+            SendEvent::CapabilityUnavailable {
+                capability: TransferCapability::Pause | TransferCapability::Resume,
+                ..
+            } => {}
             SendEvent::Verifying { transfer_id } => {
                 if self.accepts_transfer(transfer_id) {
                     self.phase = SendPhase::Verifying;
@@ -1386,6 +1445,41 @@ mod tests {
         assert!(!state.start_enabled());
         assert!(state.choose_enabled());
         assert_eq!(state.selection().unwrap().item_count(), 2);
+    }
+
+    #[test]
+    fn recovery_starts_without_rebuilding_sender_selection() {
+        let mut state = SendViewState::new();
+        let old_transfer_id = TransferId::new();
+        assert!(state.recovery_enabled());
+        assert!(matches!(
+            state.handle_action(SendAction::Recover {
+                transfer_id: old_transfer_id,
+            }),
+            Some(SendIntent::Recover { transfer_id }) if transfer_id == old_transfer_id
+        ));
+        let new_transfer_id = TransferId::new();
+        state.apply_event(SendEvent::Created {
+            transfer_id: new_transfer_id,
+        });
+        assert_eq!(state.active_transfer_id(), Some(new_transfer_id));
+        assert_eq!(
+            state.handle_action(SendAction::DiscardRecovery {
+                transfer_id: old_transfer_id,
+            }),
+            None
+        );
+        state.apply_event(SendEvent::Cancelled {
+            transfer_id: new_transfer_id,
+        });
+        assert_eq!(
+            state.handle_action(SendAction::DiscardRecovery {
+                transfer_id: old_transfer_id,
+            }),
+            Some(SendIntent::DiscardRecovery {
+                transfer_id: old_transfer_id,
+            })
+        );
     }
 
     #[test]

@@ -96,12 +96,41 @@ impl BackendError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendCapability {
     Progress,
+    Pause,
+    Resume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackendCapabilities {
+    progress: bool,
+    pause: bool,
+    resume: bool,
+}
+
+impl BackendCapabilities {
+    pub const fn new(progress: bool, pause: bool, resume: bool) -> Self {
+        Self {
+            progress,
+            pause,
+            resume,
+        }
+    }
+
+    pub const fn supports(self, capability: BackendCapability) -> bool {
+        match capability {
+            BackendCapability::Progress => self.progress,
+            BackendCapability::Pause => self.pause,
+            BackendCapability::Resume => self.resume,
+        }
+    }
 }
 
 impl fmt::Display for BackendCapability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Progress => formatter.write_str("progress reporting"),
+            Self::Pause => formatter.write_str("pause"),
+            Self::Resume => formatter.write_str("resume"),
         }
     }
 }
@@ -230,6 +259,14 @@ impl fmt::Debug for ReceiveRequest {
 
 #[async_trait]
 pub trait TransferBackend: Send + Sync {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+
+    fn version(&self) -> Option<&'static str> {
+        None
+    }
+
     async fn send(&self, request: SendRequest) -> Result<TransferHandle, BackendError>;
 
     async fn receive(&self, request: ReceiveRequest) -> Result<TransferHandle, BackendError>;
@@ -284,5 +321,13 @@ mod tests {
                 && TransferFailureKind::ProcessInterruption.is_retryable()
         );
         assert!(!TransferFailureKind::ProcessFailure.is_retryable());
+    }
+
+    #[test]
+    fn backend_capabilities_are_explicit_for_pause_resume() {
+        let backend = crate::CrocBackend::default();
+        assert!(!backend.capabilities().supports(BackendCapability::Pause));
+        assert!(!backend.capabilities().supports(BackendCapability::Resume));
+        assert_eq!(backend.version(), Some("11.2.x"));
     }
 }

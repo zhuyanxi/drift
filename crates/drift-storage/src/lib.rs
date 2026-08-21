@@ -1,5 +1,6 @@
 use drift_core::{
-    sanitize_relative_path, FileEntry, ManifestError, ResumeState, TransferId, TransferManifest,
+    sanitize_relative_path, FileEntry, ManifestError, ResumeState, ResumeStateError, TransferId,
+    TransferManifest,
 };
 use std::{
     io,
@@ -370,6 +371,8 @@ pub enum StorageError {
     Io(#[source] io::Error),
     #[error("storage serialization failed")]
     Serialization(#[source] serde_json::Error),
+    #[error("resume metadata is invalid")]
+    InvalidResume(#[source] ResumeStateError),
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -425,8 +428,25 @@ pub async fn validate_receive_directory(path: impl AsRef<Path>) -> Result<(), De
     }
 }
 
+#[derive(Clone)]
 pub struct JsonStore {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeDiscovery {
+    recoverable: Vec<ResumeState>,
+    invalid_count: usize,
+}
+
+impl ResumeDiscovery {
+    pub fn recoverable(&self) -> &[ResumeState] {
+        &self.recoverable
+    }
+
+    pub fn invalid_count(&self) -> usize {
+        self.invalid_count
+    }
 }
 
 impl JsonStore {
@@ -439,6 +459,7 @@ impl JsonStore {
     }
 
     pub async fn save_resume(&self, state: &ResumeState) -> Result<PathBuf, StorageError> {
+        state.validate().map_err(StorageError::InvalidResume)?;
         fs::create_dir_all(&self.root)
             .await
             .map_err(StorageError::Io)?;
@@ -471,17 +492,82 @@ impl JsonStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(StorageError::Io(error)),
         };
-        serde_json::from_slice(&data)
-            .map(Some)
-            .map_err(StorageError::Serialization)
+        let state: ResumeState =
+            serde_json::from_slice(&data).map_err(StorageError::Serialization)?;
+        state
+            .validate()
+            .map_err(StorageError::InvalidResume)
+            .map(|()| Some(state))
     }
 
     pub async fn remove_resume(&self, transfer_id: TransferId) -> Result<(), StorageError> {
-        match fs::remove_file(self.resume_path(transfer_id)).await {
+        let path = self.resume_path(transfer_id);
+        match fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StorageError::Io(error)),
+        }
+        match fs::remove_file(path.with_extension("resume.json.tmp")).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(StorageError::Io(error)),
         }
+    }
+
+    pub async fn discover_resumes(&self) -> Result<ResumeDiscovery, StorageError> {
+        let mut directory = match fs::read_dir(&self.root).await {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ResumeDiscovery {
+                    recoverable: Vec::new(),
+                    invalid_count: 0,
+                })
+            }
+            Err(error) => return Err(StorageError::Io(error)),
+        };
+        let mut recoverable = Vec::new();
+        let mut invalid_count = 0;
+        while let Some(entry) = directory.next_entry().await.map_err(StorageError::Io)? {
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".resume.json"))
+            {
+                continue;
+            }
+            let data = match fs::read(&path).await {
+                Ok(data) => data,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(StorageError::Io(error)),
+            };
+            match serde_json::from_slice::<ResumeState>(&data) {
+                Ok(state) if state.validate().is_ok() => recoverable.push(state),
+                Ok(_) | Err(_) => invalid_count += 1,
+            }
+        }
+        recoverable.sort_by_key(|state| state.transfer_id.to_string());
+        Ok(ResumeDiscovery {
+            recoverable,
+            invalid_count,
+        })
+    }
+
+    pub async fn discard_resume(&self, transfer_id: TransferId) -> Result<(), StorageError> {
+        let state = match self.load_resume(transfer_id).await {
+            Ok(state) => state,
+            Err(StorageError::InvalidResume(_) | StorageError::Serialization(_)) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(state) = state {
+            let partial_path = self.root.join(&state.temp_file_path);
+            match fs::remove_file(partial_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(StorageError::Io(error)),
+            }
+        }
+        self.remove_resume(transfer_id).await
     }
 
     fn resume_path(&self, transfer_id: TransferId) -> PathBuf {
@@ -510,7 +596,18 @@ mod tests {
         ));
         let store = JsonStore::new(&root);
         let state = ResumeState {
+            schema_version: drift_core::RESUME_SCHEMA_VERSION,
             transfer_id: TransferId::new(),
+            backend: "croc".into(),
+            backend_version: Some("11.2.x".into()),
+            capabilities: drift_core::ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: drift_core::ResumeRequest::Receive {
+                output_directory: PathBuf::from("/tmp/receive"),
+            },
+            manifest: None,
             file_id: Uuid::new_v4(),
             chunk_size: 4,
             file_size: 10,
@@ -524,6 +621,88 @@ mod tests {
         assert_eq!(store.load_resume(transfer_id).await.unwrap(), Some(state));
         store.remove_resume(transfer_id).await.unwrap();
         assert_eq!(store.load_resume(transfer_id).await.unwrap(), None);
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn discovers_valid_resume_and_counts_corrupt_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "drift-storage-discovery-{}",
+            TransferId::new()
+        ));
+        let store = JsonStore::new(&root);
+        let transfer_id = TransferId::new();
+        let file = FileEntry::new("source.bin", 10).unwrap();
+        let manifest = TransferManifest::new(transfer_id, vec![file.clone()]).unwrap();
+        let state = ResumeState {
+            schema_version: drift_core::RESUME_SCHEMA_VERSION,
+            transfer_id,
+            backend: "croc".into(),
+            backend_version: Some("11.2.x".into()),
+            capabilities: drift_core::ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: drift_core::ResumeRequest::Send {
+                source_paths: vec![PathBuf::from("source.bin")],
+            },
+            manifest: Some(manifest),
+            file_id: file.file_id,
+            chunk_size: 4,
+            file_size: 10,
+            completed_chunks: vec![0, 2],
+            file_digest: None,
+            temp_file_path: PathBuf::from("partial.bin"),
+        };
+        store.save_resume(&state).await.unwrap();
+        fs::write(
+            root.join(format!("{}.resume.json", TransferId::new())),
+            b"not-json",
+        )
+        .await
+        .unwrap();
+
+        let discovery = store.discover_resumes().await.unwrap();
+        assert_eq!(discovery.recoverable(), &[state]);
+        assert_eq!(discovery.invalid_count(), 1);
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn discarding_resume_removes_validated_partial_file_and_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "drift-storage-discard-{}",
+            TransferId::new()
+        ));
+        let store = JsonStore::new(&root);
+        let state = ResumeState {
+            schema_version: drift_core::RESUME_SCHEMA_VERSION,
+            transfer_id: TransferId::new(),
+            backend: "croc".into(),
+            backend_version: Some("11.2.x".into()),
+            capabilities: drift_core::ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: drift_core::ResumeRequest::Receive {
+                output_directory: PathBuf::from("/tmp/receive"),
+            },
+            manifest: None,
+            file_id: Uuid::new_v4(),
+            chunk_size: 4,
+            file_size: 10,
+            completed_chunks: vec![0, 2],
+            file_digest: None,
+            temp_file_path: PathBuf::from("partial.bin"),
+        };
+        store.save_resume(&state).await.unwrap();
+        fs::write(root.join("partial.bin"), b"partial")
+            .await
+            .unwrap();
+
+        store.discard_resume(state.transfer_id).await.unwrap();
+        assert!(!root.join("partial.bin").exists());
+        assert_eq!(store.load_resume(state.transfer_id).await.unwrap(), None);
         let _ = fs::remove_dir_all(root).await;
     }
 

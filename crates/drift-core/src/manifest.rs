@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
+    fmt,
     path::{Component, Path, PathBuf},
 };
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::TransferId;
+
+pub const RESUME_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_RESUME_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ManifestError {
@@ -68,6 +72,74 @@ pub fn sanitize_relative_path(path: &Path) -> Result<PathBuf, ManifestError> {
         return Err(ManifestError::InvalidComponent);
     }
     Ok(sanitized)
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResumeRequest {
+    Send { source_paths: Vec<PathBuf> },
+    Receive { output_directory: PathBuf },
+}
+
+impl ResumeRequest {
+    fn validate(&self) -> Result<(), ResumeStateError> {
+        match self {
+            Self::Send { source_paths } if source_paths.is_empty() => {
+                Err(ResumeStateError::InvalidRequest)
+            }
+            Self::Send { source_paths }
+                if source_paths.iter().any(|path| path.as_os_str().is_empty()) =>
+            {
+                Err(ResumeStateError::InvalidRequest)
+            }
+            Self::Receive { output_directory } if output_directory.as_os_str().is_empty() => {
+                Err(ResumeStateError::InvalidRequest)
+            }
+            Self::Send { .. } | Self::Receive { .. } => Ok(()),
+        }
+    }
+}
+
+impl fmt::Debug for ResumeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send { source_paths } => formatter
+                .debug_struct("ResumeRequest::Send")
+                .field("source_count", &source_paths.len())
+                .finish(),
+            Self::Receive { .. } => formatter
+                .debug_struct("ResumeRequest::Receive")
+                .field("output_directory_configured", &true)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeCapabilities {
+    pub pause: bool,
+    pub resume: bool,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ResumeStateError {
+    #[error("unsupported resume schema version {found}; expected {expected}")]
+    UnsupportedSchema { found: u32, expected: u32 },
+    #[error("resume backend name must not be empty")]
+    EmptyBackend,
+    #[error("resume backend version must not be empty")]
+    EmptyBackendVersion,
+    #[error("resume request is invalid")]
+    InvalidRequest,
+    #[error("resume manifest is invalid")]
+    InvalidManifest(#[source] ManifestError),
+    #[error("resume chunk size must be greater than zero")]
+    InvalidChunkSize,
+    #[error("resume temporary path must be relative and safe")]
+    InvalidTemporaryPath,
+    #[error("resume completed chunks are invalid")]
+    InvalidCompletedChunks,
+    #[error("resume file is not present in manifest")]
+    FileNotInManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,9 +322,15 @@ impl ChunkScheduler {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeState {
+    pub schema_version: u32,
     pub transfer_id: TransferId,
+    pub backend: String,
+    pub backend_version: Option<String>,
+    pub capabilities: ResumeCapabilities,
+    pub request: ResumeRequest,
+    pub manifest: Option<TransferManifest>,
     pub file_id: Uuid,
     pub chunk_size: u64,
     pub file_size: u64,
@@ -261,7 +339,90 @@ pub struct ResumeState {
     pub temp_file_path: PathBuf,
 }
 
+impl fmt::Debug for ResumeState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResumeState")
+            .field("schema_version", &self.schema_version)
+            .field("transfer_id", &self.transfer_id)
+            .field("backend", &self.backend)
+            .field("backend_version", &self.backend_version)
+            .field("capabilities", &self.capabilities)
+            .field("request", &self.request)
+            .field("manifest_configured", &self.manifest.is_some())
+            .field("file_id", &self.file_id)
+            .field("chunk_size", &self.chunk_size)
+            .field("file_size", &self.file_size)
+            .field("completed_chunk_count", &self.completed_chunks.len())
+            .field("file_digest_configured", &self.file_digest.is_some())
+            .field("temp_file_configured", &true)
+            .finish()
+    }
+}
+
 impl ResumeState {
+    pub fn validate(&self) -> Result<(), ResumeStateError> {
+        if self.schema_version != RESUME_SCHEMA_VERSION {
+            return Err(ResumeStateError::UnsupportedSchema {
+                found: self.schema_version,
+                expected: RESUME_SCHEMA_VERSION,
+            });
+        }
+        if self.backend.trim().is_empty() {
+            return Err(ResumeStateError::EmptyBackend);
+        }
+        if self.backend_version.as_deref().is_some_and(str::is_empty) {
+            return Err(ResumeStateError::EmptyBackendVersion);
+        }
+        self.request.validate()?;
+        if matches!(self.request, ResumeRequest::Send { .. }) && self.manifest.is_none() {
+            return Err(ResumeStateError::InvalidManifest(ManifestError::Empty));
+        }
+        if let Some(manifest) = &self.manifest {
+            manifest
+                .validate()
+                .map_err(ResumeStateError::InvalidManifest)?;
+            let Some(file) = manifest
+                .files
+                .iter()
+                .find(|file| file.file_id == self.file_id)
+            else {
+                return Err(ResumeStateError::FileNotInManifest);
+            };
+            if manifest.transfer_id != self.transfer_id
+                || file.size != self.file_size
+                || file.digest != self.file_digest
+            {
+                return Err(ResumeStateError::FileNotInManifest);
+            }
+        }
+        if self.chunk_size == 0 {
+            return Err(ResumeStateError::InvalidChunkSize);
+        }
+        if self.temp_file_path.is_absolute()
+            || sanitize_relative_path(&self.temp_file_path).is_err()
+        {
+            return Err(ResumeStateError::InvalidTemporaryPath);
+        }
+        let chunk_count = if self.file_size == 0 {
+            0
+        } else {
+            (self.file_size - 1) / self.chunk_size + 1
+        };
+        if self
+            .completed_chunks
+            .windows(2)
+            .any(|window| window[0] >= window[1])
+            || self
+                .completed_chunks
+                .iter()
+                .any(|index| *index >= chunk_count)
+        {
+            return Err(ResumeStateError::InvalidCompletedChunks);
+        }
+        Ok(())
+    }
+
     pub fn is_completed(&self, chunk_index: u64) -> bool {
         self.completed_chunks.binary_search(&chunk_index).is_ok()
     }
@@ -380,7 +541,18 @@ mod tests {
     #[test]
     fn resume_state_keeps_completed_chunks_sorted_and_unique() {
         let mut state = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
             transfer_id: TransferId::new(),
+            backend: "croc".into(),
+            backend_version: Some("11.2.x".into()),
+            capabilities: ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: ResumeRequest::Send {
+                source_paths: vec![PathBuf::from("source.bin")],
+            },
+            manifest: None,
             file_id: Uuid::new_v4(),
             chunk_size: 4,
             file_size: 10,
@@ -393,5 +565,36 @@ mod tests {
         state.mark_completed(2);
         assert_eq!(state.completed_chunks, vec![0, 2]);
         assert!(state.is_completed(2));
+    }
+
+    #[test]
+    fn rejects_incompatible_resume_metadata_without_secret_fields() {
+        let transfer_id = TransferId::new();
+        let state = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION + 1,
+            transfer_id,
+            backend: "croc".into(),
+            backend_version: Some("11.2.x".into()),
+            capabilities: ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: ResumeRequest::Receive {
+                output_directory: PathBuf::from("/tmp/receive"),
+            },
+            manifest: None,
+            file_id: Uuid::nil(),
+            chunk_size: DEFAULT_RESUME_CHUNK_SIZE,
+            file_size: 0,
+            completed_chunks: Vec::new(),
+            file_digest: None,
+            temp_file_path: PathBuf::from("partial.bin"),
+        };
+
+        assert!(matches!(
+            state.validate(),
+            Err(ResumeStateError::UnsupportedSchema { .. })
+        ));
+        assert!(!format!("{state:?}").contains("/tmp/receive"));
     }
 }

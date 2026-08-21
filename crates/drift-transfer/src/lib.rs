@@ -1,14 +1,17 @@
 use drift_core::{
-    Role, TransferCapability, TransferError, TransferEvent, TransferFailureKind, TransferId,
-    TransferManifest, TransferSession, TransferState,
+    ResumeCapabilities, ResumeRequest, ResumeState, Role, TransferCapability, TransferError,
+    TransferEvent, TransferFailureKind, TransferId, TransferManifest, TransferSession,
+    TransferState, DEFAULT_RESUME_CHUNK_SIZE, RESUME_SCHEMA_VERSION,
 };
 use drift_protocol::{
-    BackendCapability, BackendError, BackendEvent, ReceiveRequest, SendRequest, TransferBackend,
-    TransferHandle,
+    BackendCapabilities, BackendCapability, BackendError, BackendEvent, ReceiveRequest,
+    SendRequest, TransferBackend, TransferHandle,
 };
+use drift_storage::{JsonStore, StorageError};
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransferNotification {
@@ -22,6 +25,7 @@ struct ManagerInner<B> {
     sessions: RwLock<HashMap<TransferId, TransferSession>>,
     active: Mutex<HashMap<TransferId, ActiveAttempt>>,
     retry_requests: Mutex<HashMap<TransferId, RetryRequest>>,
+    resume_store: Option<JsonStore>,
     events: broadcast::Sender<TransferNotification>,
 }
 
@@ -55,6 +59,22 @@ where
     }
 
     pub fn with_backend_name(backend: B, backend_name: impl Into<String>) -> Self {
+        Self::with_optional_resume_store(backend, backend_name, None)
+    }
+
+    pub fn with_resume_store(
+        backend: B,
+        backend_name: impl Into<String>,
+        resume_store: JsonStore,
+    ) -> Self {
+        Self::with_optional_resume_store(backend, backend_name, Some(resume_store))
+    }
+
+    fn with_optional_resume_store(
+        backend: B,
+        backend_name: impl Into<String>,
+        resume_store: Option<JsonStore>,
+    ) -> Self {
         let (events, _) = broadcast::channel(64);
         Self {
             inner: Arc::new(ManagerInner {
@@ -63,6 +83,7 @@ where
                 sessions: RwLock::new(HashMap::new()),
                 active: Mutex::new(HashMap::new()),
                 retry_requests: Mutex::new(HashMap::new()),
+                resume_store,
                 events,
             }),
         }
@@ -70,6 +91,24 @@ where
 
     pub fn subscribe(&self) -> broadcast::Receiver<TransferNotification> {
         self.inner.events.subscribe()
+    }
+
+    pub fn capabilities(&self) -> BackendCapabilities {
+        self.inner.backend.capabilities()
+    }
+
+    pub fn backend_version(&self) -> Option<&'static str> {
+        self.inner.backend.version()
+    }
+
+    pub async fn pause(&self, transfer_id: TransferId) -> Result<(), TransferError> {
+        self.require_capability(transfer_id, TransferCapability::Pause)
+            .await
+    }
+
+    pub async fn resume(&self, transfer_id: TransferId) -> Result<(), TransferError> {
+        self.require_capability(transfer_id, TransferCapability::Resume)
+            .await
     }
 
     pub async fn session(&self, transfer_id: TransferId) -> Option<TransferSession> {
@@ -176,13 +215,83 @@ where
             .await
             .remove(&transfer_id)
             .ok_or_else(|| E::from(TransferError::RetryNotAllowed(session.state)))?;
-        match request {
+        let result = match request {
             RetryRequest::Send { request, manifest } => self
                 .start_send_attempt(request, manifest)
                 .await
                 .map_err(E::from),
             RetryRequest::Receive { request } => {
                 self.start_receive_attempt(request).await.map_err(E::from)
+            }
+        };
+        if result.is_ok() {
+            self.clear_recovery_metadata(transfer_id).await;
+        }
+        result
+    }
+
+    pub async fn recover(
+        &self,
+        state: ResumeState,
+        receive_code: Option<String>,
+    ) -> Result<TransferId, TransferError> {
+        state
+            .validate()
+            .map_err(|_| TransferError::Backend("invalid resume metadata".into()))?;
+        if state.backend != self.inner.backend_name
+            || state.backend_version.as_deref() != self.inner.backend.version()
+        {
+            return Err(TransferError::Backend(
+                "resume backend is incompatible".into(),
+            ));
+        }
+        if state.capabilities.resume
+            != self
+                .inner
+                .backend
+                .capabilities()
+                .supports(BackendCapability::Resume)
+        {
+            return Err(TransferError::CapabilityUnavailable(
+                TransferCapability::Resume,
+            ));
+        }
+        let old_transfer_id = state.transfer_id;
+        let result = match state.request {
+            ResumeRequest::Send { source_paths } => {
+                let request = SendRequest::new(source_paths)
+                    .map_err(|_| TransferError::Backend("invalid resume request".into()))?;
+                self.start_send_with_manifest(request, state.manifest).await
+            }
+            ResumeRequest::Receive { output_directory } => {
+                let code = receive_code.ok_or(TransferError::Backend(
+                    "receive recovery requires transfer code".into(),
+                ))?;
+                let request = ReceiveRequest::new(code, output_directory)
+                    .map_err(|_| TransferError::Backend("invalid resume request".into()))?;
+                self.start_receive(request).await
+            }
+        };
+        if result.is_ok() {
+            self.clear_recovery_metadata(old_transfer_id).await;
+        }
+        result
+    }
+
+    pub async fn discard_recovery(&self, transfer_id: TransferId) -> Result<(), TransferError> {
+        let Some(store) = &self.inner.resume_store else {
+            return Ok(());
+        };
+        store
+            .discard_resume(transfer_id)
+            .await
+            .map_err(map_storage_error)
+    }
+
+    async fn clear_recovery_metadata(&self, transfer_id: TransferId) {
+        if let Some(store) = &self.inner.resume_store {
+            if let Err(error) = store.discard_resume(transfer_id).await {
+                warn!(%transfer_id, error = %safe_storage_error(&error), "failed to clear recovery metadata");
             }
         }
     }
@@ -356,6 +465,18 @@ where
             session.set_code(code);
         }
         let transfer_id = session.id;
+        let retry_request = match retry_request {
+            RetryRequest::Send {
+                request,
+                mut manifest,
+            } => {
+                if let Some(manifest) = &mut manifest {
+                    manifest.transfer_id = transfer_id;
+                }
+                RetryRequest::Send { request, manifest }
+            }
+            RetryRequest::Receive { request } => RetryRequest::Receive { request },
+        };
         let (cancellation, cancellation_receiver) = watch::channel(false);
         let (completion, _) = watch::channel(false);
         self.inner.active.lock().await.insert(
@@ -375,6 +496,7 @@ where
             .write()
             .await
             .insert(transfer_id, session);
+        self.persist_recovery(transfer_id).await;
         self.emit(transfer_id, TransferEvent::Created);
         (transfer_id, cancellation_receiver)
     }
@@ -494,6 +616,8 @@ where
             BackendEvent::CapabilityUnavailable { capability } => {
                 let capability = match capability {
                     BackendCapability::Progress => TransferCapability::Progress,
+                    BackendCapability::Pause => TransferCapability::Pause,
+                    BackendCapability::Resume => TransferCapability::Resume,
                 };
                 self.emit(
                     transfer_id,
@@ -578,6 +702,9 @@ where
                     .await
                     .and_then(|session| session.failure_kind)
                     .is_some_and(TransferFailureKind::is_retryable);
+                if retryable {
+                    self.persist_recovery(transfer_id).await;
+                }
                 self.cleanup_attempt(transfer_id, retryable).await;
             }
         }
@@ -593,9 +720,113 @@ where
             .map(|attempt| attempt.completion);
         if !keep_retry_request {
             self.inner.retry_requests.lock().await.remove(&transfer_id);
+            self.clear_recovery_metadata(transfer_id).await;
         }
         if let Some(completion) = completion {
             let _ = completion.send(true);
+        }
+    }
+
+    async fn require_capability(
+        &self,
+        transfer_id: TransferId,
+        capability: TransferCapability,
+    ) -> Result<(), TransferError> {
+        if self
+            .inner
+            .backend
+            .capabilities()
+            .supports(match capability {
+                TransferCapability::Progress => BackendCapability::Progress,
+                TransferCapability::Pause => BackendCapability::Pause,
+                TransferCapability::Resume => BackendCapability::Resume,
+            })
+        {
+            let _ = self
+                .session(transfer_id)
+                .await
+                .ok_or_else(|| TransferError::Backend("transfer session not found".into()))?;
+            Err(TransferError::Backend(
+                "backend control handshake is not implemented".into(),
+            ))
+        } else {
+            Err(TransferError::CapabilityUnavailable(capability))
+        }
+    }
+
+    async fn persist_recovery(&self, transfer_id: TransferId) {
+        let Some(store) = &self.inner.resume_store else {
+            return;
+        };
+        let Some(session) = self.session(transfer_id).await else {
+            return;
+        };
+        let request = self
+            .inner
+            .retry_requests
+            .lock()
+            .await
+            .get(&transfer_id)
+            .cloned();
+        let Some(request) = request else {
+            return;
+        };
+        let (request, manifest, file_id, file_size, file_digest) = match request {
+            RetryRequest::Send { request, manifest } => {
+                let (file_id, file_size, file_digest) = manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.files.first())
+                    .map_or((Uuid::nil(), 0, None), |file| {
+                        (file.file_id, file.size, file.digest.clone())
+                    });
+                (
+                    ResumeRequest::Send {
+                        source_paths: request.paths,
+                    },
+                    manifest,
+                    file_id,
+                    file_size,
+                    file_digest,
+                )
+            }
+            RetryRequest::Receive { request } => (
+                ResumeRequest::Receive {
+                    output_directory: request.output_directory,
+                },
+                None,
+                Uuid::nil(),
+                0,
+                None,
+            ),
+        };
+        let state = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
+            transfer_id,
+            backend: session.backend,
+            backend_version: self.inner.backend.version().map(str::to_owned),
+            capabilities: ResumeCapabilities {
+                pause: self
+                    .inner
+                    .backend
+                    .capabilities()
+                    .supports(BackendCapability::Pause),
+                resume: self
+                    .inner
+                    .backend
+                    .capabilities()
+                    .supports(BackendCapability::Resume),
+            },
+            request,
+            manifest,
+            file_id,
+            chunk_size: DEFAULT_RESUME_CHUNK_SIZE,
+            file_size,
+            completed_chunks: Vec::new(),
+            file_digest,
+            temp_file_path: PathBuf::from(format!("partials/{transfer_id}.partial")),
+        };
+        if let Err(error) = store.save_resume(&state).await {
+            warn!(%transfer_id, error = %safe_storage_error(&error), "failed to persist resume metadata");
         }
     }
 
@@ -664,6 +895,18 @@ where
             .events
             .send(TransferNotification { transfer_id, event });
         debug!(%transfer_id, "transfer event emitted");
+    }
+}
+
+fn map_storage_error(error: StorageError) -> TransferError {
+    TransferError::Backend(safe_storage_error(&error).into())
+}
+
+fn safe_storage_error(error: &StorageError) -> &'static str {
+    match error {
+        StorageError::Io(_) => "resume storage unavailable",
+        StorageError::Serialization(_) => "resume metadata is unreadable",
+        StorageError::InvalidResume(_) => "resume metadata is invalid",
     }
 }
 
@@ -1107,5 +1350,149 @@ mod tests {
             Err(TransferError::RetryNotAllowed(TransferState::Failed))
         );
         let _ = std::fs::remove_file(script);
+    }
+
+    #[tokio::test]
+    async fn croc_pause_and_resume_report_capability_unavailable() {
+        let manager = TransferManager::new(CrocBackend::default());
+        let transfer_id = manager.create_session(Role::Sender).await;
+
+        assert_eq!(
+            manager.pause(transfer_id).await,
+            Err(TransferError::CapabilityUnavailable(
+                TransferCapability::Pause
+            ))
+        );
+        assert_eq!(
+            manager.resume(transfer_id).await,
+            Err(TransferError::CapabilityUnavailable(
+                TransferCapability::Resume
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persists_secret_free_recovery_and_restarts_only_after_explicit_action() {
+        let script = versioned_script("sleep 1");
+        let root = std::env::temp_dir().join(format!(
+            "drift-transfer-recovery-{}",
+            TransferId::new()
+        ));
+        let store = JsonStore::new(&root);
+        let manager = TransferManager::with_resume_store(
+            CrocBackend::new(&script).with_timeout(std::time::Duration::from_millis(50)),
+            "croc",
+            store.clone(),
+        );
+        let mut events = manager.subscribe();
+        let transfer_id = manager
+            .start_receive(ReceiveRequest::new("secret-transfer-code", &root).unwrap())
+            .await
+            .unwrap();
+        assert!(store.load_resume(transfer_id).await.unwrap().is_some());
+        loop {
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if notification.transfer_id == transfer_id
+                && notification.event == TransferEvent::Failed
+            {
+                break;
+            }
+        }
+        let state = loop {
+            if let Some(state) = store.load_resume(transfer_id).await.unwrap() {
+                break state;
+            }
+            tokio::task::yield_now().await;
+        };
+        let serialized = tokio::fs::read(root.join(format!("{transfer_id}.resume.json")))
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&serialized).contains("secret-transfer-code"));
+        assert!(!state.capabilities.resume);
+        assert!(matches!(state.request, ResumeRequest::Receive { .. }));
+
+        let new_transfer_id = manager
+            .recover(state, Some("secret-transfer-code".into()))
+            .await
+            .unwrap();
+        assert_ne!(new_transfer_id, transfer_id);
+        manager.cancel(new_transfer_id).await.unwrap();
+        assert_eq!(store.load_resume(new_transfer_id).await.unwrap(), None);
+        manager.discard_recovery(transfer_id).await.unwrap();
+        assert_eq!(store.load_resume(transfer_id).await.unwrap(), None);
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sender_recovery_persists_manifest_for_new_attempt_id() {
+        let script = versioned_script("sleep 1");
+        let root = std::env::temp_dir().join(format!(
+            "drift-transfer-sender-recovery-{}",
+            TransferId::new()
+        ));
+        let store = JsonStore::new(&root);
+        let manager = TransferManager::with_resume_store(
+            CrocBackend::new(&script).with_timeout(std::time::Duration::from_millis(50)),
+            "croc",
+            store.clone(),
+        );
+        let manifest = TransferManifest::new(
+            TransferId::new(),
+            vec![FileEntry::new("source.bin", 1).unwrap()],
+        )
+        .unwrap();
+        let transfer_id = manager
+            .start_send_with_manifest(
+                SendRequest::new(vec![PathBuf::from("source.bin")]).unwrap(),
+                Some(manifest),
+            )
+            .await
+            .unwrap();
+        let state = store.load_resume(transfer_id).await.unwrap().unwrap();
+        assert_eq!(state.manifest.as_ref().unwrap().transfer_id, transfer_id);
+        manager.cancel(transfer_id).await.unwrap();
+        assert_eq!(store.load_resume(transfer_id).await.unwrap(), None);
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_process_failure_removes_recovery_metadata() {
+        let script = versioned_script("exit 7");
+        let root = std::env::temp_dir().join(format!(
+            "drift-transfer-terminal-{}",
+            TransferId::new()
+        ));
+        let store = JsonStore::new(&root);
+        let manager =
+            TransferManager::with_resume_store(CrocBackend::new(&script), "croc", store.clone());
+        let mut events = manager.subscribe();
+        let transfer_id = manager
+            .start_send(SendRequest::new(vec![PathBuf::from("source.bin")]).unwrap())
+            .await
+            .unwrap();
+        loop {
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if notification.transfer_id == transfer_id
+                && notification.event == TransferEvent::Failed
+            {
+                break;
+            }
+        }
+        assert_eq!(store.load_resume(transfer_id).await.unwrap(), None);
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

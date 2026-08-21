@@ -1451,8 +1451,10 @@ version = "0.1.0"
 dependencies = [
  "drift-core",
  "drift-protocol",
+ "drift-storage",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

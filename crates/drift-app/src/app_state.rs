@@ -2,9 +2,14 @@ use crate::event_bridge::{AppEventBridge, AppTransferUpdate, TransferPresentatio
 use crate::settings::{
     ConfigPathError, DriftSettings, SettingsError, SettingsLoader, SettingsSource,
 };
-use drift_core::{TransferId, TransferManifest};
+use drift_core::{
+    ResumeRequest, ResumeState, TransferCapability, TransferError, TransferId, TransferManifest,
+};
 use drift_protocol::{BackendError, CrocBackend, ReceiveRequest, SendRequest};
-use drift_storage::{validate_receive_directory, DestinationError, JsonStore};
+use drift_storage::{
+    scan_send_paths, validate_receive_directory, DestinationError, JsonStore, ResumeDiscovery,
+    StorageError,
+};
 use drift_transfer::TransferManager;
 use std::{
     fmt,
@@ -94,6 +99,7 @@ impl AppState {
             backend: self.backend.clone(),
             transfer_manager: self.transfer_manager.clone(),
             event_bridge: self.event_bridge.clone(),
+            resume_store: self.resume_store.clone(),
             default_receive_directory: self.settings.transfer.default_receive_directory.clone(),
         }
     }
@@ -109,9 +115,10 @@ impl AppState {
         if let Some(relay) = loaded.settings.relay.url.clone() {
             backend = backend.with_relay(relay);
         }
-        let transfer_manager = TransferManager::with_backend_name(backend.clone(), "croc");
-        let event_bridge = AppEventBridge::start(runtime.handle(), transfer_manager.clone());
         let resume_store = JsonStore::new(resume_root(loader.path()));
+        let transfer_manager =
+            TransferManager::with_resume_store(backend.clone(), "croc", resume_store.clone());
+        let event_bridge = AppEventBridge::start(runtime.handle(), transfer_manager.clone());
 
         Ok(Self {
             settings: loaded.settings,
@@ -132,6 +139,7 @@ pub struct AppHandle {
     backend: CrocBackend,
     transfer_manager: TransferManager<CrocBackend>,
     event_bridge: AppEventBridge,
+    resume_store: JsonStore,
     default_receive_directory: PathBuf,
 }
 
@@ -162,11 +170,28 @@ impl AppHandle {
         })
     }
 
+    pub fn recoveries(&self) -> JoinHandle<Result<ResumeDiscovery, AppCommandError>> {
+        let store = self.resume_store.clone();
+        self.runtime.spawn(async move {
+            store
+                .discover_resumes()
+                .await
+                .map_err(AppCommandError::from)
+        })
+    }
+
     pub fn dispatch(&self, command: AppCommand) -> JoinHandle<Result<TransferId, AppCommandError>> {
         let transfer_manager = self.transfer_manager.clone();
+        let resume_store = self.resume_store.clone();
         let default_receive_directory = self.default_receive_directory.clone();
         self.runtime.spawn(async move {
-            dispatch_command(transfer_manager, default_receive_directory, command).await
+            dispatch_command(
+                transfer_manager,
+                resume_store,
+                default_receive_directory,
+                command,
+            )
+            .await
         })
     }
 
@@ -198,6 +223,19 @@ pub enum AppCommand {
     RetryTransfer {
         transfer_id: TransferId,
     },
+    PauseTransfer {
+        transfer_id: TransferId,
+    },
+    ResumeTransfer {
+        transfer_id: TransferId,
+    },
+    RecoverTransfer {
+        transfer_id: TransferId,
+        code: Option<String>,
+    },
+    DiscardRecovery {
+        transfer_id: TransferId,
+    },
 }
 
 impl fmt::Debug for AppCommand {
@@ -222,6 +260,23 @@ impl fmt::Debug for AppCommand {
                 .debug_struct("RetryTransfer")
                 .field("transfer_id", transfer_id)
                 .finish(),
+            Self::PauseTransfer { transfer_id } => formatter
+                .debug_struct("PauseTransfer")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::ResumeTransfer { transfer_id } => formatter
+                .debug_struct("ResumeTransfer")
+                .field("transfer_id", transfer_id)
+                .finish(),
+            Self::RecoverTransfer { transfer_id, code } => formatter
+                .debug_struct("RecoverTransfer")
+                .field("transfer_id", transfer_id)
+                .field("code_configured", &code.is_some())
+                .finish(),
+            Self::DiscardRecovery { transfer_id } => formatter
+                .debug_struct("DiscardRecovery")
+                .field("transfer_id", transfer_id)
+                .finish(),
         }
     }
 }
@@ -242,6 +297,12 @@ pub enum AppCommandError {
     EmptyTransferCode,
     #[error("transfer command failed")]
     Transfer(#[source] drift_core::TransferError),
+    #[error("recovery metadata is unavailable")]
+    RecoveryUnavailable,
+    #[error("recovery metadata is invalid")]
+    RecoveryInvalid,
+    #[error("recovery storage is unavailable")]
+    RecoveryStorage(#[source] StorageError),
 }
 
 impl AppCommandError {
@@ -253,7 +314,17 @@ impl AppCommandError {
             Self::OutputDirectoryUnavailable => "The receive folder is unavailable.",
             Self::OutputDirectoryNotWritable => "The receive folder is not writable.",
             Self::EmptyTransferCode => "Enter a transfer code.",
+            Self::Transfer(TransferError::CapabilityUnavailable(TransferCapability::Pause)) => {
+                "Pause is unavailable for this backend."
+            }
+            Self::Transfer(TransferError::CapabilityUnavailable(TransferCapability::Resume)) => {
+                "Resume is unavailable for this backend."
+            }
             Self::Transfer(_) => "The transfer could not start.",
+            Self::RecoveryUnavailable | Self::RecoveryInvalid => {
+                "The transfer recovery is no longer available."
+            }
+            Self::RecoveryStorage(_) => "Transfer recovery storage is unavailable.",
         }
     }
 }
@@ -276,8 +347,15 @@ impl From<DestinationError> for AppCommandError {
     }
 }
 
+impl From<StorageError> for AppCommandError {
+    fn from(error: StorageError) -> Self {
+        Self::RecoveryStorage(error)
+    }
+}
+
 async fn dispatch_command(
     transfer_manager: TransferManager<CrocBackend>,
+    resume_store: JsonStore,
     default_receive_directory: PathBuf,
     command: AppCommand,
 ) -> Result<TransferId, AppCommandError> {
@@ -321,7 +399,81 @@ async fn dispatch_command(
                 })
                 .await
         }
+        AppCommand::PauseTransfer { transfer_id } => transfer_manager
+            .pause(transfer_id)
+            .await
+            .map(|()| transfer_id)
+            .map_err(AppCommandError::Transfer),
+        AppCommand::ResumeTransfer { transfer_id } => transfer_manager
+            .resume(transfer_id)
+            .await
+            .map(|()| transfer_id)
+            .map_err(AppCommandError::Transfer),
+        AppCommand::RecoverTransfer { transfer_id, code } => {
+            let state = resume_store
+                .load_resume(transfer_id)
+                .await
+                .map_err(AppCommandError::from)?
+                .ok_or(AppCommandError::RecoveryUnavailable)?;
+            validate_recovery_inputs(&state, code.as_deref()).await?;
+            resume_store
+                .discard_resume(transfer_id)
+                .await
+                .map_err(AppCommandError::from)?;
+            let new_transfer_id = transfer_manager
+                .recover(state, code)
+                .await
+                .map_err(AppCommandError::Transfer)?;
+            Ok(new_transfer_id)
+        }
+        AppCommand::DiscardRecovery { transfer_id } => resume_store
+            .discard_resume(transfer_id)
+            .await
+            .map(|()| transfer_id)
+            .map_err(AppCommandError::from),
     }
+}
+
+async fn validate_recovery_inputs(
+    state: &ResumeState,
+    receive_code: Option<&str>,
+) -> Result<(), AppCommandError> {
+    match &state.request {
+        ResumeRequest::Send { source_paths } => {
+            let scan =
+                scan_send_paths(source_paths.clone(), drift_storage::ScanCancellation::new())
+                    .await
+                    .map_err(|_| AppCommandError::RecoveryInvalid)?;
+            let Some(expected) = &state.manifest else {
+                return Err(AppCommandError::RecoveryInvalid);
+            };
+            if !manifests_match(expected, scan.manifest()) {
+                return Err(AppCommandError::RecoveryInvalid);
+            }
+        }
+        ResumeRequest::Receive { output_directory } => {
+            if receive_code.is_none_or(|code| code.trim().is_empty()) {
+                return Err(AppCommandError::EmptyTransferCode);
+            }
+            validate_receive_directory(output_directory)
+                .await
+                .map_err(AppCommandError::from)?;
+        }
+    }
+    Ok(())
+}
+
+fn manifests_match(expected: &TransferManifest, actual: &TransferManifest) -> bool {
+    expected.total_size == actual.total_size
+        && expected.files.len() == actual.files.len()
+        && expected.files.iter().all(|expected_file| {
+            actual.files.iter().any(|actual_file| {
+                expected_file.relative_path == actual_file.relative_path
+                    && expected_file.size == actual_file.size
+                    && expected_file.modified_at == actual_file.modified_at
+                    && expected_file.digest == actual_file.digest
+            })
+        })
 }
 
 fn resume_root(config_path: &Path) -> PathBuf {
@@ -411,6 +563,85 @@ mod tests {
     }
 
     #[test]
+    fn pause_and_resume_commands_report_unsupported_backend_safely() {
+        let root = temp_path();
+        let config_path = root.join("config").join("config.json");
+        let settings = DriftSettings::default();
+        SettingsLoader::with_path(&config_path)
+            .save(&settings)
+            .unwrap();
+        let state = AppState::bootstrap_with_config_path(&config_path).unwrap();
+        let transfer_id = TransferId::new();
+
+        let pause = state
+            .runtime
+            .block_on(
+                state
+                    .handle()
+                    .dispatch(AppCommand::PauseTransfer { transfer_id }),
+            )
+            .unwrap();
+        assert!(matches!(
+            pause,
+            Err(AppCommandError::Transfer(
+                TransferError::CapabilityUnavailable(TransferCapability::Pause)
+            ))
+        ));
+        assert_eq!(
+            AppCommandError::Transfer(TransferError::CapabilityUnavailable(
+                TransferCapability::Pause
+            ))
+            .user_message(),
+            "Pause is unavailable for this backend."
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_missing_sender_source_before_backend_start() {
+        let root = temp_path();
+        let store = JsonStore::new(root.join("state"));
+        let transfer_id = TransferId::new();
+        let file = drift_core::FileEntry::new("source.bin", 1).unwrap();
+        let manifest = TransferManifest::new(transfer_id, vec![file.clone()]).unwrap();
+        let state = ResumeState {
+            schema_version: drift_core::RESUME_SCHEMA_VERSION,
+            transfer_id,
+            backend: "croc".into(),
+            backend_version: Some("11.2.x".into()),
+            capabilities: drift_core::ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: ResumeRequest::Send {
+                source_paths: vec![root.join("missing-source.bin")],
+            },
+            manifest: Some(manifest),
+            file_id: file.file_id,
+            chunk_size: drift_core::DEFAULT_RESUME_CHUNK_SIZE,
+            file_size: 1,
+            completed_chunks: Vec::new(),
+            file_digest: None,
+            temp_file_path: PathBuf::from("partials/partial.bin"),
+        };
+        let manager = TransferManager::new(CrocBackend::default());
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(store.save_resume(&state)).unwrap();
+
+        let result = runtime.block_on(dispatch_command(
+            manager,
+            store,
+            root.clone(),
+            AppCommand::RecoverTransfer {
+                transfer_id,
+                code: None,
+            },
+        ));
+        assert!(matches!(result, Err(AppCommandError::RecoveryInvalid)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn receive_dispatch_rejects_unavailable_destination_before_backend() {
         let root = temp_path();
         let config_path = root.join("config").join("config.json");
@@ -446,6 +677,7 @@ mod tests {
             "if [ \"$1\" = \"--version\" ]; then printf 'v11.2.2-build\\n'; exit 0; fi\nsleep 1",
         );
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let resume_store = JsonStore::new(root.join("state"));
         let manager = TransferManager::new(
             CrocBackend::new(&script).with_timeout(std::time::Duration::from_millis(50)),
         );
@@ -454,6 +686,7 @@ mod tests {
         let result = runtime.block_on(async {
             let transfer_id = dispatch_command(
                 manager.clone(),
+                resume_store.clone(),
                 receive_directory.clone(),
                 AppCommand::Receive {
                     code: "transfer-code".into(),
@@ -479,6 +712,7 @@ mod tests {
 
         let retry_result = runtime.block_on(dispatch_command(
             manager,
+            resume_store,
             root.clone(),
             AppCommand::RetryTransfer {
                 transfer_id: result,

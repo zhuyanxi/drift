@@ -13,6 +13,18 @@ pub use send::{
     SendProgress, SendSelection, SendViewState,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryKind {
+    Send,
+    Receive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryCandidate {
+    pub transfer_id: drift_core::TransferId,
+    pub kind: RecoveryKind,
+}
+
 #[cfg(feature = "gui")]
 mod gui {
     use gpui::{
@@ -26,12 +38,25 @@ mod gui {
 
     use super::{
         ReceiveAction, ReceiveCommandError, ReceiveController, ReceiveEventStream, ReceiveIntent,
-        ReceivePhase, ReceiveViewState, SendAction, SendCommandError, SendController,
-        SendEventStream, SendIntent, SendPhase, SendViewState,
+        ReceivePhase, ReceiveViewState, RecoveryCandidate, RecoveryKind, SendAction,
+        SendCommandError, SendController, SendEventStream, SendIntent, SendPhase, SendViewState,
     };
 
-    actions!(send, [ChooseFiles, StartSend, CopyTransferCode, CancelSend]);
-    actions!(receive, [ChooseDestination, CheckCroc, StartReceive, CancelReceive]);
+    actions!(
+        send,
+        [ChooseFiles, StartSend, CopyTransferCode, CancelSend, RecoverSend, DiscardSendRecovery]
+    );
+    actions!(
+        receive,
+        [
+            ChooseDestination,
+            CheckCroc,
+            StartReceive,
+            CancelReceive,
+            RecoverReceive,
+            DiscardReceiveRecovery
+        ]
+    );
     actions!(navigation, [ShowSend, ShowReceive]);
 
     trait ClipboardService: Send + Sync {
@@ -180,6 +205,8 @@ mod gui {
         receive_focus: FocusHandle,
         _send_event_task: Task<()>,
         _receive_event_task: Task<()>,
+        _recovery_task: Task<()>,
+        recovery_candidates: Vec<RecoveryCandidate>,
         command_task: Option<Task<()>>,
     }
 
@@ -237,6 +264,19 @@ mod gui {
                     }
                 });
             let receive = ReceiveViewState::new(receive_controller.default_destination());
+            let recovery_controller = Arc::clone(&controller);
+            let recovery_task = cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    let candidates = recovery_controller
+                        .recoveries()
+                        .await
+                        .unwrap_or_default();
+                    let _ = this.update(&mut *cx, |view, cx| {
+                        view.recovery_candidates = candidates;
+                        cx.notify();
+                    });
+                },
+            );
             let initial_validation = receive.destination_validation_intent();
             let initial_command_task = initial_validation.and_then(|intent| {
                 let ReceiveIntent::ValidateDestination { generation, path } = intent else {
@@ -270,6 +310,8 @@ mod gui {
                 receive_focus: cx.focus_handle(),
                 _send_event_task: send_event_task,
                 _receive_event_task: receive_event_task,
+                _recovery_task: recovery_task,
+                recovery_candidates: Vec::new(),
                 command_task: initial_command_task,
             }
         }
@@ -291,6 +333,10 @@ mod gui {
                 }
                 SendIntent::Start { paths, manifest } => self.start_transfer(paths, manifest, cx),
                 SendIntent::Retry { transfer_id } => self.retry_transfer(transfer_id, cx),
+                SendIntent::Recover { transfer_id } => self.recover_send(transfer_id, cx),
+                SendIntent::DiscardRecovery { transfer_id } => {
+                    self.discard_send_recovery(transfer_id, cx)
+                }
                 SendIntent::CopyCode { code } => {
                     let result = self.clipboard.copy(&code, cx);
                     self.send.mark_copy_result(result);
@@ -322,6 +368,12 @@ mod gui {
                 }
                 ReceiveIntent::Retry { transfer_id } => {
                     self.retry_receive_transfer(transfer_id, cx)
+                }
+                ReceiveIntent::Recover {
+                    transfer_id, code, ..
+                } => self.recover_receive(transfer_id, code, cx),
+                ReceiveIntent::DiscardRecovery { transfer_id } => {
+                    self.discard_receive_recovery(transfer_id, cx)
                 }
                 ReceiveIntent::Cancel { transfer_id } => {
                     self.cancel_receive_transfer(transfer_id, cx)
@@ -374,6 +426,49 @@ mod gui {
                         }
                         cx.notify();
                     });
+                },
+            ));
+        }
+
+        fn recover_send(&mut self, transfer_id: drift_core::TransferId, cx: &mut Context<Self>) {
+            let controller = Arc::clone(&self.controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    match controller.recover(transfer_id).await {
+                        Ok(new_transfer_id) => {
+                            let _ = this.update(&mut *cx, |view, cx| {
+                                view.send.mark_start_succeeded(new_transfer_id);
+                                view.recovery_candidates
+                                    .retain(|candidate| candidate.transfer_id != transfer_id);
+                                cx.notify();
+                            });
+                        }
+                        Err(_) => {
+                            let _ = this.update(&mut *cx, |view, cx| {
+                                view.send.mark_start_failed();
+                                cx.notify();
+                            });
+                        }
+                    }
+                },
+            ));
+        }
+
+        fn discard_send_recovery(
+            &mut self,
+            transfer_id: drift_core::TransferId,
+            cx: &mut Context<Self>,
+        ) {
+            let controller = Arc::clone(&self.controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    if controller.discard_recovery(transfer_id).await.is_ok() {
+                        let _ = this.update(&mut *cx, |view, cx| {
+                            view.recovery_candidates
+                                .retain(|candidate| candidate.transfer_id != transfer_id);
+                            cx.notify();
+                        });
+                    }
                 },
             ));
         }
@@ -440,6 +535,54 @@ mod gui {
                                 cx.notify();
                             });
                         }
+                    }
+                },
+            ));
+        }
+
+        fn recover_receive(
+            &mut self,
+            transfer_id: drift_core::TransferId,
+            code: String,
+            cx: &mut Context<Self>,
+        ) {
+            let controller = Arc::clone(&self.receive_controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    match controller.recover(transfer_id, code).await {
+                        Ok(new_transfer_id) => {
+                            let _ = this.update(&mut *cx, |view, cx| {
+                                view.receive.mark_start_succeeded(new_transfer_id);
+                                view.recovery_candidates
+                                    .retain(|candidate| candidate.transfer_id != transfer_id);
+                                cx.notify();
+                            });
+                        }
+                        Err(_) => {
+                            let _ = this.update(&mut *cx, |view, cx| {
+                                view.receive.mark_start_failed();
+                                cx.notify();
+                            });
+                        }
+                    }
+                },
+            ));
+        }
+
+        fn discard_receive_recovery(
+            &mut self,
+            transfer_id: drift_core::TransferId,
+            cx: &mut Context<Self>,
+        ) {
+            let controller = Arc::clone(&self.receive_controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    if controller.discard_recovery(transfer_id).await.is_ok() {
+                        let _ = this.update(&mut *cx, |view, cx| {
+                            view.recovery_candidates
+                                .retain(|candidate| candidate.transfer_id != transfer_id);
+                            cx.notify();
+                        });
                     }
                 },
             ));
@@ -783,6 +926,42 @@ mod gui {
             let clear = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
                 view.dispatch_action(SendAction::ClearSelection, cx);
             });
+            let mut recovery_panel = div().flex().flex_col().gap_2();
+            for candidate in self
+                .recovery_candidates
+                .iter()
+                .filter(|candidate| candidate.kind == RecoveryKind::Send)
+                .copied()
+            {
+                let recover_id = candidate.transfer_id;
+                let discard_id = candidate.transfer_id;
+                let recover = cx.listener(move |view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_action(SendAction::Recover { transfer_id: recover_id }, cx);
+                });
+                let discard = cx.listener(move |view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_action(SendAction::DiscardRecovery { transfer_id: discard_id }, cx);
+                });
+                recovery_panel = recovery_panel.child(
+                    div()
+                        .id(SharedString::from(format!("send-recovery-{recover_id}")))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child("Interrupted send available")
+                        .child(action_button(
+                            SharedString::from(format!("send-recover-{recover_id}")),
+                            "Recover",
+                            self.send.recovery_enabled(),
+                            recover,
+                        ))
+                        .child(action_button(
+                            SharedString::from(format!("send-discard-{discard_id}")),
+                            "Discard",
+                            self.send.recovery_enabled(),
+                            discard,
+                        )),
+                );
+            }
 
             let mut code_panel = div().flex().items_center().gap_2();
             if let Some(code) = self.send.transfer_code() {
@@ -808,6 +987,36 @@ mod gui {
                 .on_action(cx.listener(|view: &mut MainView, _: &CancelSend, _, cx| {
                     view.dispatch_action(SendAction::Cancel, cx);
                 }))
+                .on_action(cx.listener(|view: &mut MainView, _: &RecoverSend, _, cx| {
+                    if let Some(candidate) = view
+                        .recovery_candidates
+                        .iter()
+                        .find(|candidate| candidate.kind == RecoveryKind::Send)
+                        .copied()
+                    {
+                        view.dispatch_action(
+                            SendAction::Recover {
+                                transfer_id: candidate.transfer_id,
+                            },
+                            cx,
+                        );
+                    }
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &DiscardSendRecovery, _, cx| {
+                    if let Some(candidate) = view
+                        .recovery_candidates
+                        .iter()
+                        .find(|candidate| candidate.kind == RecoveryKind::Send)
+                        .copied()
+                    {
+                        view.dispatch_action(
+                            SendAction::DiscardRecovery {
+                                transfer_id: candidate.transfer_id,
+                            },
+                            cx,
+                        );
+                    }
+                }))
                 .size_full()
                 .p_8()
                 .flex()
@@ -822,6 +1031,7 @@ mod gui {
                 .child(div().child("Send"))
                 .child(self.render_navigation(cx))
                 .child(div().child(phase.label()))
+                .child(recovery_panel)
                 .child(
                     div()
                         .id("send-selection")
@@ -929,6 +1139,52 @@ mod gui {
             let cancel = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
                 view.dispatch_receive_action(ReceiveAction::Cancel, cx);
             });
+            let mut recovery_panel = div().flex().flex_col().gap_2();
+            for candidate in self
+                .recovery_candidates
+                .iter()
+                .filter(|candidate| candidate.kind == RecoveryKind::Receive)
+                .copied()
+            {
+                let recover_id = candidate.transfer_id;
+                let discard_id = candidate.transfer_id;
+                let recover = cx.listener(move |view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_receive_action(
+                        ReceiveAction::Recover {
+                            transfer_id: recover_id,
+                        },
+                        cx,
+                    );
+                });
+                let discard = cx.listener(move |view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_receive_action(
+                        ReceiveAction::DiscardRecovery {
+                            transfer_id: discard_id,
+                        },
+                        cx,
+                    );
+                });
+                recovery_panel = recovery_panel.child(
+                    div()
+                        .id(SharedString::from(format!("receive-recovery-{recover_id}")))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child("Interrupted receive available")
+                        .child(action_button(
+                            SharedString::from(format!("receive-recover-{recover_id}")),
+                            "Recover",
+                            self.receive.recovery_enabled(),
+                            recover,
+                        ))
+                        .child(action_button(
+                            SharedString::from(format!("receive-discard-{discard_id}")),
+                            "Discard",
+                            self.receive.recovery_enabled(),
+                            discard,
+                        )),
+                );
+            }
             let code_field = if self.receive.code().is_empty() {
                 "Paste transfer code".to_owned()
             } else {
@@ -958,6 +1214,36 @@ mod gui {
                 .on_action(cx.listener(|view: &mut MainView, _: &CancelReceive, _, cx| {
                     view.dispatch_receive_action(ReceiveAction::Cancel, cx);
                 }))
+                .on_action(cx.listener(|view: &mut MainView, _: &RecoverReceive, _, cx| {
+                    if let Some(candidate) = view
+                        .recovery_candidates
+                        .iter()
+                        .find(|candidate| candidate.kind == RecoveryKind::Receive)
+                        .copied()
+                    {
+                        view.dispatch_receive_action(
+                            ReceiveAction::Recover {
+                                transfer_id: candidate.transfer_id,
+                            },
+                            cx,
+                        );
+                    }
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &DiscardReceiveRecovery, _, cx| {
+                    if let Some(candidate) = view
+                        .recovery_candidates
+                        .iter()
+                        .find(|candidate| candidate.kind == RecoveryKind::Receive)
+                        .copied()
+                    {
+                        view.dispatch_receive_action(
+                            ReceiveAction::DiscardRecovery {
+                                transfer_id: candidate.transfer_id,
+                            },
+                            cx,
+                        );
+                    }
+                }))
                 .size_full()
                 .p_8()
                 .flex()
@@ -968,6 +1254,7 @@ mod gui {
                 .child(div().child("Receive"))
                 .child(self.render_navigation(cx))
                 .child(div().child(phase.label()))
+                .child(recovery_panel)
                 .child(
                     div()
                         .id("receive-code-input")
