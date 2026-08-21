@@ -229,16 +229,9 @@ impl SettingsController for AppSettingsController {
     ) -> SettingsFuture<Result<RelaySettingsSnapshot, SettingsCommandError>> {
         let handle = self.handle.clone();
         Box::pin(async move {
-            let current = match handle.settings().await {
-                Ok(Ok(settings)) => settings,
-                Ok(Err(_)) | Err(_) => {
-                    return Err(settings_error(SettingsCommandErrorKind::LoadFailed))
-                }
-            };
             let relay = RelaySettings {
                 enabled,
                 url: endpoint,
-                credential_ref: current.relay.credential_ref,
             };
             match handle.update_relay(relay).await {
                 Ok(Ok(settings)) => Ok(relay_snapshot(&settings.relay)),

@@ -164,8 +164,11 @@ impl AppHandle {
 
     pub fn settings(&self) -> JoinHandle<Result<DriftSettings, AppCommandError>> {
         let settings_store = self.settings_store.clone();
-        self.runtime
-            .spawn_blocking(move || settings_store.snapshot().map_err(AppCommandError::from))
+        self.runtime.spawn_blocking(move || {
+            settings_store
+                .snapshot()
+                .map_err(AppCommandError::SettingsLoad)
+        })
     }
 
     pub fn update_relay(
@@ -176,14 +179,17 @@ impl AppHandle {
         self.runtime.spawn_blocking(move || {
             settings_store
                 .update_relay(relay)
-                .map_err(AppCommandError::from)
+                .map_err(AppCommandError::Settings)
         })
     }
 
     pub fn clear_relay(&self) -> JoinHandle<Result<DriftSettings, AppCommandError>> {
         let settings_store = self.settings_store.clone();
-        self.runtime
-            .spawn_blocking(move || settings_store.clear_relay().map_err(AppCommandError::from))
+        self.runtime.spawn_blocking(move || {
+            settings_store
+                .clear_relay()
+                .map_err(AppCommandError::Settings)
+        })
     }
 
     pub fn validate_destination(
@@ -338,7 +344,9 @@ pub enum AppCommandError {
     RecoveryInvalid,
     #[error("recovery storage is unavailable")]
     RecoveryStorage(#[source] StorageError),
-    #[error("settings could not be updated")]
+    #[error("settings could not be loaded")]
+    SettingsLoad(#[source] SettingsError),
+    #[error("settings could not be saved")]
     Settings(#[source] SettingsError),
 }
 
@@ -362,6 +370,7 @@ impl AppCommandError {
                 "The transfer recovery is no longer available."
             }
             Self::RecoveryStorage(_) => "Transfer recovery storage is unavailable.",
+            Self::SettingsLoad(_) => "Settings could not be loaded.",
             Self::Settings(_) => "Settings could not be saved.",
         }
     }
@@ -393,7 +402,7 @@ impl From<StorageError> for AppCommandError {
 
 impl From<SettingsError> for AppCommandError {
     fn from(error: SettingsError) -> Self {
-        Self::Settings(error)
+        Self::SettingsLoad(error)
     }
 }
 
@@ -406,7 +415,9 @@ async fn dispatch_command(
 ) -> Result<TransferId, AppCommandError> {
     match command {
         AppCommand::Send { paths, manifest } => {
-            let settings = settings_store.snapshot().map_err(AppCommandError::from)?;
+            let settings = settings_store
+                .snapshot()
+                .map_err(AppCommandError::SettingsLoad)?;
             let request = SendRequest::new(paths).map_err(AppCommandError::InvalidRequest)?;
             let request = apply_relay(request, &settings);
             transfer_manager
@@ -418,7 +429,9 @@ async fn dispatch_command(
             code,
             output_directory,
         } => {
-            let settings = settings_store.snapshot().map_err(AppCommandError::from)?;
+            let settings = settings_store
+                .snapshot()
+                .map_err(AppCommandError::SettingsLoad)?;
             let output_directory = output_directory.unwrap_or(default_receive_directory);
             if code.trim().is_empty() {
                 return Err(AppCommandError::EmptyTransferCode);
@@ -648,7 +661,6 @@ mod tests {
             .update_relay(RelaySettings {
                 enabled: true,
                 url: Some("https://first-relay.example.test".into()),
-                credential_ref: None,
             })
             .unwrap();
 
@@ -666,7 +678,6 @@ mod tests {
             .update_relay(RelaySettings {
                 enabled: true,
                 url: Some("https://second-relay.example.test".into()),
-                credential_ref: None,
             })
             .unwrap();
 
@@ -687,13 +698,48 @@ mod tests {
         settings.relay = RelaySettings {
             enabled: false,
             url: Some("https://configured-but-disabled.example.test".into()),
-            credential_ref: None,
         };
         let request = apply_relay(
             SendRequest::new(vec![PathBuf::from("source.txt")]).unwrap(),
             &settings,
         );
         assert_eq!(request.relay, None);
+    }
+
+    #[test]
+    fn dispatch_reports_invalid_settings_as_load_failure() {
+        let root = temp_path();
+        fs::create_dir_all(&root).unwrap();
+        let mut settings = DriftSettings::default();
+        settings.relay = RelaySettings {
+            enabled: true,
+            url: Some("ftp://relay.example.test".into()),
+        };
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+
+        let result = runtime.block_on(dispatch_command(
+            TransferManager::new(CrocBackend::default()),
+            JsonStore::new(root.join("state")),
+            SettingsStore::new(
+                SettingsLoader::with_path(root.join("config.json")),
+                settings,
+            ),
+            root.clone(),
+            AppCommand::Receive {
+                code: "transfer-code".into(),
+                output_directory: Some(root.clone()),
+            },
+        ));
+        let error = result.unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AppCommandError::SettingsLoad(SettingsError::Validation(
+                crate::settings::SettingsValidationError::InvalidRelayUrl
+            ))
+        ));
+        assert_eq!(error.user_message(), "Settings could not be loaded.");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -64,7 +64,6 @@ impl DriftSettings {
 pub struct RelaySettings {
     pub enabled: bool,
     pub url: Option<String>,
-    pub credential_ref: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for RelaySettings {
@@ -77,14 +76,12 @@ impl<'de> Deserialize<'de> for RelaySettings {
         struct RelaySettingsData {
             enabled: Option<bool>,
             url: Option<String>,
-            credential_ref: Option<String>,
         }
 
         let data = RelaySettingsData::deserialize(deserializer)?;
         Ok(Self {
             enabled: data.enabled.unwrap_or(data.url.is_some()),
             url: data.url,
-            credential_ref: data.credential_ref,
         })
     }
 }
@@ -98,13 +95,6 @@ impl RelaySettings {
         } else if self.enabled {
             return Err(SettingsValidationError::MissingRelayUrl);
         }
-        if self
-            .credential_ref
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            return Err(SettingsValidationError::InvalidRelayCredentialRef);
-        }
         Ok(())
     }
 
@@ -115,7 +105,6 @@ impl RelaySettings {
     pub fn clear(&mut self) {
         self.enabled = false;
         self.url = None;
-        self.credential_ref = None;
     }
 }
 
@@ -125,7 +114,6 @@ impl fmt::Debug for RelaySettings {
             .debug_struct("RelaySettings")
             .field("enabled", &self.enabled)
             .field("url_configured", &self.url.is_some())
-            .field("credential_ref_configured", &self.credential_ref.is_some())
             .finish()
     }
 }
@@ -135,7 +123,6 @@ impl Default for RelaySettings {
         Self {
             enabled: false,
             url: None,
-            credential_ref: None,
         }
     }
 }
@@ -212,8 +199,6 @@ pub enum SettingsValidationError {
     MissingRelayUrl,
     #[error("relay URL must use http or https and include a host")]
     InvalidRelayUrl,
-    #[error("relay credential reference must not be empty")]
-    InvalidRelayCredentialRef,
     #[error("transfer timeout must be positive")]
     NonPositiveTimeout,
     #[error("default receive directory must not be empty")]
@@ -634,6 +619,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_relay_credential_reference_is_ignored() {
+        let relay: RelaySettings = serde_json::from_str(
+            r#"{
+                "enabled": true,
+                "url": "https://relay.example.test",
+                "credential_ref": "legacy-secret-reference"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(relay.url.as_deref(), Some("https://relay.example.test"));
+        assert!(!serde_json::to_string(&relay)
+            .unwrap()
+            .contains("legacy-secret-reference"));
+    }
+
+    #[test]
     fn invalid_json_returns_parse_error() {
         let directory = temp_directory();
         let path = directory.join("config.json");
@@ -654,7 +656,6 @@ mod tests {
         let relay = RelaySettings {
             enabled: true,
             url: Some("https://relay.example.test:443".into()),
-            credential_ref: None,
         };
 
         let updated = store.update_relay(relay.clone()).unwrap();
@@ -681,7 +682,6 @@ mod tests {
         let invalid_relay = RelaySettings {
             enabled: true,
             url: Some("ftp://relay.example.test".into()),
-            credential_ref: None,
         };
 
         assert!(matches!(

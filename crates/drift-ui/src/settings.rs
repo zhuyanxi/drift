@@ -2,10 +2,20 @@ use std::{fmt, future::Future, pin::Pin};
 
 pub type SettingsFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RelaySettingsSnapshot {
     enabled: bool,
     endpoint: Option<String>,
+}
+
+impl fmt::Debug for RelaySettingsSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelaySettingsSnapshot")
+            .field("enabled", &self.enabled)
+            .field("endpoint_configured", &self.endpoint.is_some())
+            .finish()
+    }
 }
 
 impl RelaySettingsSnapshot {
@@ -301,6 +311,18 @@ mod tests {
         ));
         assert_eq!(state.phase(), SettingsPhase::Saving);
         assert!(!format!("{state:?}").contains("new-relay.example.test"));
+    }
+
+    #[test]
+    fn relay_snapshot_debug_redacts_endpoint() {
+        let snapshot = RelaySettingsSnapshot::new(
+            true,
+            Some("https://user:pass@relay.example.test".to_owned()),
+        );
+        let debug = format!("{snapshot:?}");
+
+        assert!(!debug.contains("user:pass@relay.example.test"));
+        assert!(debug.contains("endpoint_configured: true"));
     }
 
     #[test]
