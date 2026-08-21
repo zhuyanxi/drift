@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::TransferId;
 
-pub const RESUME_SCHEMA_VERSION: u32 = 1;
+pub const RESUME_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_RESUME_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -336,7 +336,7 @@ pub struct ResumeState {
     pub file_size: u64,
     pub completed_chunks: Vec<u64>,
     pub file_digest: Option<String>,
-    pub temp_file_path: PathBuf,
+    pub temp_file_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for ResumeState {
@@ -355,7 +355,7 @@ impl fmt::Debug for ResumeState {
             .field("file_size", &self.file_size)
             .field("completed_chunk_count", &self.completed_chunks.len())
             .field("file_digest_configured", &self.file_digest.is_some())
-            .field("temp_file_configured", &true)
+            .field("temp_file_configured", &self.temp_file_path.is_some())
             .finish()
     }
 }
@@ -399,10 +399,10 @@ impl ResumeState {
         if self.chunk_size == 0 {
             return Err(ResumeStateError::InvalidChunkSize);
         }
-        if self.temp_file_path.is_absolute()
-            || sanitize_relative_path(&self.temp_file_path).is_err()
-        {
-            return Err(ResumeStateError::InvalidTemporaryPath);
+        if let Some(temp_file_path) = &self.temp_file_path {
+            if temp_file_path.is_absolute() || sanitize_relative_path(temp_file_path).is_err() {
+                return Err(ResumeStateError::InvalidTemporaryPath);
+            }
         }
         let chunk_count = if self.file_size == 0 {
             0
@@ -558,7 +558,7 @@ mod tests {
             file_size: 10,
             completed_chunks: Vec::new(),
             file_digest: None,
-            temp_file_path: PathBuf::from("partial.bin"),
+            temp_file_path: None,
         };
         state.mark_completed(2);
         state.mark_completed(0);
@@ -588,7 +588,7 @@ mod tests {
             file_size: 0,
             completed_chunks: Vec::new(),
             file_digest: None,
-            temp_file_path: PathBuf::from("partial.bin"),
+            temp_file_path: None,
         };
 
         assert!(matches!(

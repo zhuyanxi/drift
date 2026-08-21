@@ -50,6 +50,7 @@ pub trait ReceiveController: Send + Sync {
         &self,
         _transfer_id: TransferId,
         _code: String,
+        _destination: PathBuf,
     ) -> ReceiveFuture<Result<TransferId, ReceiveCommandError>> {
         Box::pin(async { Err(ReceiveCommandError::start_failed()) })
     }
@@ -542,6 +543,10 @@ impl ReceiveViewState {
             )
     }
 
+    pub fn discard_recovery_enabled(&self) -> bool {
+        self.active_transfer_id.is_none() && self.phase != ReceivePhase::Starting
+    }
+
     pub fn destination_validation_intent(&self) -> Option<ReceiveIntent> {
         self.destination.as_ref().map(|path| ReceiveIntent::ValidateDestination {
             generation: self.destination_generation,
@@ -683,9 +688,7 @@ impl ReceiveViewState {
                     destination,
                 })
             }
-            ReceiveAction::DiscardRecovery { transfer_id }
-                if self.active_transfer_id.is_none() =>
-            {
+            ReceiveAction::DiscardRecovery { transfer_id } if self.discard_recovery_enabled() => {
                 Some(ReceiveIntent::DiscardRecovery { transfer_id })
             }
             ReceiveAction::Cancel if self.cancel_enabled() => {
@@ -1168,13 +1171,36 @@ mod tests {
             state.handle_action(ReceiveAction::Recover {
                 transfer_id: old_transfer_id,
             }),
-            Some(ReceiveIntent::Recover { transfer_id, .. }) if transfer_id == old_transfer_id
+            Some(ReceiveIntent::Recover {
+                transfer_id,
+                destination,
+                ..
+            }) if transfer_id == old_transfer_id && destination == PathBuf::from("/tmp/receive")
         ));
+        assert!(!state.discard_recovery_enabled());
+        assert_eq!(
+            state.handle_action(ReceiveAction::DiscardRecovery {
+                transfer_id: old_transfer_id,
+            }),
+            None
+        );
         let new_transfer_id = TransferId::new();
         state.apply_event(ReceiveEvent::Created {
             transfer_id: new_transfer_id,
         });
         assert_eq!(state.active_transfer_id(), Some(new_transfer_id));
         assert_eq!(state.code(), "transfer-code");
+    }
+
+    #[test]
+    fn startup_recovery_can_be_discarded_without_receive_inputs() {
+        let mut state = ReceiveViewState::new(None);
+        let transfer_id = TransferId::new();
+
+        assert!(state.discard_recovery_enabled());
+        assert!(matches!(
+            state.handle_action(ReceiveAction::DiscardRecovery { transfer_id }),
+            Some(ReceiveIntent::DiscardRecovery { transfer_id: found }) if found == transfer_id
+        ));
     }
 }

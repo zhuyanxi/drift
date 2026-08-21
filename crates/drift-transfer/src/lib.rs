@@ -234,6 +234,7 @@ where
         &self,
         state: ResumeState,
         receive_code: Option<String>,
+        receive_output_directory: Option<PathBuf>,
     ) -> Result<TransferId, TransferError> {
         state
             .validate()
@@ -263,10 +264,13 @@ where
                     .map_err(|_| TransferError::Backend("invalid resume request".into()))?;
                 self.start_send_with_manifest(request, state.manifest).await
             }
-            ResumeRequest::Receive { output_directory } => {
+            ResumeRequest::Receive {
+                output_directory,
+            } => {
                 let code = receive_code.ok_or(TransferError::Backend(
                     "receive recovery requires transfer code".into(),
                 ))?;
+                let output_directory = receive_output_directory.unwrap_or(output_directory);
                 let request = ReceiveRequest::new(code, output_directory)
                     .map_err(|_| TransferError::Backend("invalid resume request".into()))?;
                 self.start_receive(request).await
@@ -823,7 +827,7 @@ where
             file_size,
             completed_chunks: Vec::new(),
             file_digest,
-            temp_file_path: PathBuf::from(format!("partials/{transfer_id}.partial")),
+            temp_file_path: None,
         };
         if let Err(error) = store.save_resume(&state).await {
             warn!(%transfer_id, error = %safe_storage_error(&error), "failed to persist resume metadata");
@@ -1373,6 +1377,80 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn recovery_uses_explicit_receive_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "drift-transfer-recovery-destination-{}",
+            TransferId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let arguments_path = root.join("arguments.txt");
+        let persisted_directory = root.join("persisted");
+        let selected_directory = root.join("selected");
+        let script = versioned_script(&format!(
+            "printf '%s\\n' \"$@\" > \"{}\"; exit 0",
+            arguments_path.display()
+        ));
+        let manager = TransferManager::new(CrocBackend::new(&script));
+        let mut events = manager.subscribe();
+        let state = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
+            transfer_id: TransferId::new(),
+            backend: "croc".into(),
+            backend_version: Some("11.2.x".into()),
+            capabilities: ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: ResumeRequest::Receive {
+                output_directory: persisted_directory.clone(),
+            },
+            manifest: None,
+            file_id: Uuid::nil(),
+            chunk_size: DEFAULT_RESUME_CHUNK_SIZE,
+            file_size: 0,
+            completed_chunks: Vec::new(),
+            file_digest: None,
+            temp_file_path: None,
+        };
+
+        let new_transfer_id = manager
+            .recover(
+                state,
+                Some("secret-transfer-code".into()),
+                Some(selected_directory.clone()),
+            )
+            .await
+            .unwrap();
+        loop {
+            let notification = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if notification.transfer_id == new_transfer_id
+                && matches!(
+                    notification.event,
+                    TransferEvent::Completed | TransferEvent::Failed
+                )
+            {
+                break;
+            }
+        }
+
+        let arguments = std::fs::read_to_string(&arguments_path).unwrap();
+        let selected_text = selected_directory.to_string_lossy().into_owned();
+        let persisted_text = persisted_directory.to_string_lossy().into_owned();
+        assert!(arguments.lines().any(|argument| argument == selected_text));
+        assert!(!arguments.lines().any(|argument| argument == persisted_text));
+
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn persists_secret_free_recovery_and_restarts_only_after_explicit_action() {
         let script = versioned_script("sleep 1");
         let root = std::env::temp_dir().join(format!(
@@ -1417,7 +1495,7 @@ mod tests {
         assert!(matches!(state.request, ResumeRequest::Receive { .. }));
 
         let new_transfer_id = manager
-            .recover(state, Some("secret-transfer-code".into()))
+            .recover(state, Some("secret-transfer-code".into()), None)
             .await
             .unwrap();
         assert_ne!(new_transfer_id, transfer_id);

@@ -232,6 +232,7 @@ pub enum AppCommand {
     RecoverTransfer {
         transfer_id: TransferId,
         code: Option<String>,
+        output_directory: Option<PathBuf>,
     },
     DiscardRecovery {
         transfer_id: TransferId,
@@ -268,10 +269,15 @@ impl fmt::Debug for AppCommand {
                 .debug_struct("ResumeTransfer")
                 .field("transfer_id", transfer_id)
                 .finish(),
-            Self::RecoverTransfer { transfer_id, code } => formatter
+            Self::RecoverTransfer {
+                transfer_id,
+                code,
+                output_directory,
+            } => formatter
                 .debug_struct("RecoverTransfer")
                 .field("transfer_id", transfer_id)
                 .field("code_configured", &code.is_some())
+                .field("output_directory_configured", &output_directory.is_some())
                 .finish(),
             Self::DiscardRecovery { transfer_id } => formatter
                 .debug_struct("DiscardRecovery")
@@ -409,19 +415,19 @@ async fn dispatch_command(
             .await
             .map(|()| transfer_id)
             .map_err(AppCommandError::Transfer),
-        AppCommand::RecoverTransfer { transfer_id, code } => {
+        AppCommand::RecoverTransfer {
+            transfer_id,
+            code,
+            output_directory,
+        } => {
             let state = resume_store
                 .load_resume(transfer_id)
                 .await
                 .map_err(AppCommandError::from)?
                 .ok_or(AppCommandError::RecoveryUnavailable)?;
-            validate_recovery_inputs(&state, code.as_deref()).await?;
-            resume_store
-                .discard_resume(transfer_id)
-                .await
-                .map_err(AppCommandError::from)?;
+            validate_recovery_inputs(&state, code.as_deref(), output_directory.as_deref()).await?;
             let new_transfer_id = transfer_manager
-                .recover(state, code)
+                .recover(state, code, output_directory)
                 .await
                 .map_err(AppCommandError::Transfer)?;
             Ok(new_transfer_id)
@@ -437,6 +443,7 @@ async fn dispatch_command(
 async fn validate_recovery_inputs(
     state: &ResumeState,
     receive_code: Option<&str>,
+    replacement_output_directory: Option<&Path>,
 ) -> Result<(), AppCommandError> {
     match &state.request {
         ResumeRequest::Send { source_paths } => {
@@ -455,7 +462,8 @@ async fn validate_recovery_inputs(
             if receive_code.is_none_or(|code| code.trim().is_empty()) {
                 return Err(AppCommandError::EmptyTransferCode);
             }
-            validate_receive_directory(output_directory)
+            let output_directory = replacement_output_directory.unwrap_or(output_directory);
+            validate_receive_directory(output_directory.to_path_buf())
                 .await
                 .map_err(AppCommandError::from)?;
         }
@@ -622,7 +630,7 @@ mod tests {
             file_size: 1,
             completed_chunks: Vec::new(),
             file_digest: None,
-            temp_file_path: PathBuf::from("partials/partial.bin"),
+            temp_file_path: None,
         };
         let manager = TransferManager::new(CrocBackend::default());
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
@@ -635,9 +643,60 @@ mod tests {
             AppCommand::RecoverTransfer {
                 transfer_id,
                 code: None,
+                output_directory: None,
             },
         ));
         assert!(matches!(result, Err(AppCommandError::RecoveryInvalid)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_preserves_metadata_when_backend_is_incompatible() {
+        let root = temp_path();
+        let output_directory = root.join("received");
+        fs::create_dir_all(&output_directory).unwrap();
+        let store = JsonStore::new(root.join("state"));
+        let transfer_id = TransferId::new();
+        let state = ResumeState {
+            schema_version: drift_core::RESUME_SCHEMA_VERSION,
+            transfer_id,
+            backend: "other-backend".into(),
+            backend_version: Some("1.0.0".into()),
+            capabilities: drift_core::ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: ResumeRequest::Receive {
+                output_directory: output_directory.clone(),
+            },
+            manifest: None,
+            file_id: Uuid::nil(),
+            chunk_size: drift_core::DEFAULT_RESUME_CHUNK_SIZE,
+            file_size: 0,
+            completed_chunks: Vec::new(),
+            file_digest: None,
+            temp_file_path: None,
+        };
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(store.save_resume(&state)).unwrap();
+
+        let result = runtime.block_on(dispatch_command(
+            TransferManager::new(CrocBackend::default()),
+            store.clone(),
+            output_directory,
+            AppCommand::RecoverTransfer {
+                transfer_id,
+                code: Some("transfer-code".into()),
+                output_directory: None,
+            },
+        ));
+
+        assert!(matches!(
+            result,
+            Err(AppCommandError::Transfer(TransferError::Backend(message)))
+                if message == "resume backend is incompatible"
+        ));
+        assert_eq!(runtime.block_on(store.load_resume(transfer_id)).unwrap(), Some(state));
         fs::remove_dir_all(root).unwrap();
     }
 

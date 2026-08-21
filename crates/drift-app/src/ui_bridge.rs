@@ -130,6 +130,7 @@ impl SendController for AppSendController {
                 .dispatch(AppCommand::RecoverTransfer {
                     transfer_id,
                     code: None,
+                    output_directory: None,
                 })
                 .await
             {
@@ -292,6 +293,7 @@ impl ReceiveController for AppReceiveController {
         &self,
         transfer_id: TransferId,
         code: String,
+        destination: PathBuf,
     ) -> ReceiveFuture<Result<TransferId, ReceiveCommandError>> {
         let handle = self.handle.clone();
         Box::pin(async move {
@@ -299,6 +301,7 @@ impl ReceiveController for AppReceiveController {
                 .dispatch(AppCommand::RecoverTransfer {
                     transfer_id,
                     code: Some(code),
+                    output_directory: Some(destination),
                 })
                 .await
             {

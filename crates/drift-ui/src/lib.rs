@@ -370,8 +370,10 @@ mod gui {
                     self.retry_receive_transfer(transfer_id, cx)
                 }
                 ReceiveIntent::Recover {
-                    transfer_id, code, ..
-                } => self.recover_receive(transfer_id, code, cx),
+                    transfer_id,
+                    code,
+                    destination,
+                } => self.recover_receive(transfer_id, code, destination, cx),
                 ReceiveIntent::DiscardRecovery { transfer_id } => {
                     self.discard_receive_recovery(transfer_id, cx)
                 }
@@ -544,12 +546,13 @@ mod gui {
             &mut self,
             transfer_id: drift_core::TransferId,
             code: String,
+            destination: std::path::PathBuf,
             cx: &mut Context<Self>,
         ) {
             let controller = Arc::clone(&self.receive_controller);
             self.command_task = Some(cx.spawn(
                 async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
-                    match controller.recover(transfer_id, code).await {
+                    match controller.recover(transfer_id, code, destination).await {
                         Ok(new_transfer_id) => {
                             let _ = this.update(&mut *cx, |view, cx| {
                                 view.receive.mark_start_succeeded(new_transfer_id);
@@ -1180,7 +1183,7 @@ mod gui {
                         .child(action_button(
                             SharedString::from(format!("receive-discard-{discard_id}")),
                             "Discard",
-                            self.receive.recovery_enabled(),
+                            self.receive.discard_recovery_enabled(),
                             discard,
                         )),
                 );

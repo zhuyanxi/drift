@@ -560,11 +560,13 @@ impl JsonStore {
             Err(error) => return Err(error),
         };
         if let Some(state) = state {
-            let partial_path = self.root.join(&state.temp_file_path);
-            match fs::remove_file(partial_path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(StorageError::Io(error)),
+            if let Some(temp_file_path) = state.temp_file_path {
+                let partial_path = self.root.join(temp_file_path);
+                match fs::remove_file(partial_path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(StorageError::Io(error)),
+                }
             }
         }
         self.remove_resume(transfer_id).await
@@ -613,7 +615,7 @@ mod tests {
             file_size: 10,
             completed_chunks: vec![0, 2],
             file_digest: Some("digest".into()),
-            temp_file_path: PathBuf::from("partial.bin"),
+            temp_file_path: Some(PathBuf::from("partial.bin")),
         };
         let transfer_id = state.transfer_id;
 
@@ -652,7 +654,7 @@ mod tests {
             file_size: 10,
             completed_chunks: vec![0, 2],
             file_digest: None,
-            temp_file_path: PathBuf::from("partial.bin"),
+            temp_file_path: Some(PathBuf::from("partial.bin")),
         };
         store.save_resume(&state).await.unwrap();
         fs::write(
@@ -669,7 +671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discarding_resume_removes_validated_partial_file_and_metadata() {
+    async fn discarding_resume_removes_explicitly_owned_partial_file_and_metadata() {
         let root = std::env::temp_dir().join(format!(
             "drift-storage-discard-{}",
             TransferId::new()
@@ -693,7 +695,7 @@ mod tests {
             file_size: 10,
             completed_chunks: vec![0, 2],
             file_digest: None,
-            temp_file_path: PathBuf::from("partial.bin"),
+            temp_file_path: Some(PathBuf::from("partial.bin")),
         };
         store.save_resume(&state).await.unwrap();
         fs::write(root.join("partial.bin"), b"partial")
@@ -702,6 +704,46 @@ mod tests {
 
         store.discard_resume(state.transfer_id).await.unwrap();
         assert!(!root.join("partial.bin").exists());
+        assert_eq!(store.load_resume(state.transfer_id).await.unwrap(), None);
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn discarding_croc_resume_preserves_unowned_partial_path() {
+        let root = std::env::temp_dir().join(format!(
+            "drift-storage-unowned-partial-{}",
+            TransferId::new()
+        ));
+        let store = JsonStore::new(&root);
+        let state = ResumeState {
+            schema_version: drift_core::RESUME_SCHEMA_VERSION,
+            transfer_id: TransferId::new(),
+            backend: "croc".into(),
+            backend_version: Some("11.2.x".into()),
+            capabilities: drift_core::ResumeCapabilities {
+                pause: false,
+                resume: false,
+            },
+            request: drift_core::ResumeRequest::Receive {
+                output_directory: PathBuf::from("/tmp/receive"),
+            },
+            manifest: None,
+            file_id: Uuid::new_v4(),
+            chunk_size: 4,
+            file_size: 10,
+            completed_chunks: vec![0, 2],
+            file_digest: None,
+            temp_file_path: None,
+        };
+        let partial_directory = root.join("partials");
+        let partial_path = partial_directory.join(format!("{}.partial", state.transfer_id));
+        store.save_resume(&state).await.unwrap();
+        fs::create_dir_all(&partial_directory).await.unwrap();
+        fs::write(&partial_path, b"croc-owned output").await.unwrap();
+
+        store.discard_resume(state.transfer_id).await.unwrap();
+
+        assert!(partial_path.exists());
         assert_eq!(store.load_resume(state.transfer_id).await.unwrap(), None);
         let _ = fs::remove_dir_all(root).await;
     }
