@@ -25,6 +25,7 @@ struct ManagerInner<B> {
     backend: Arc<B>,
     backend_name: String,
     sessions: RwLock<HashMap<TransferId, TransferSession>>,
+    completed_receive_destinations: RwLock<HashMap<TransferId, PathBuf>>,
     active: Mutex<HashMap<TransferId, ActiveAttempt>>,
     retry_requests: Mutex<HashMap<TransferId, RetryRequest>>,
     resume_store: Option<JsonStore>,
@@ -84,6 +85,7 @@ where
                 backend: Arc::new(backend),
                 backend_name: backend_name.into(),
                 sessions: RwLock::new(HashMap::new()),
+                completed_receive_destinations: RwLock::new(HashMap::new()),
                 active: Mutex::new(HashMap::new()),
                 retry_requests: Mutex::new(HashMap::new()),
                 resume_store,
@@ -120,6 +122,15 @@ where
 
     pub async fn sessions(&self) -> Vec<TransferSession> {
         self.inner.sessions.read().await.values().cloned().collect()
+    }
+
+    pub async fn completed_receive_destination(&self, transfer_id: TransferId) -> Option<PathBuf> {
+        self.inner
+            .completed_receive_destinations
+            .read()
+            .await
+            .get(&transfer_id)
+            .cloned()
     }
 
     pub async fn start_send(&self, request: SendRequest) -> Result<TransferId, TransferError> {
@@ -721,6 +732,9 @@ where
             return;
         }
         let receive_staging = self.receive_staging(transfer_id).await;
+        let receive_destination = receive_staging
+            .as_ref()
+            .map(|staging| staging.destination().to_path_buf());
         match result {
             Ok(_) => {
                 if let Err(error) = self
@@ -768,6 +782,13 @@ where
                         }
                     }
                 }
+                if let Some(destination) = receive_destination {
+                    self.inner
+                        .completed_receive_destinations
+                        .write()
+                        .await
+                        .insert(transfer_id, destination);
+                }
                 if let Err(error) = self
                     .advance(
                         transfer_id,
@@ -777,6 +798,11 @@ where
                     .await
                 {
                     warn!(%transfer_id, %error, "failed to complete transfer");
+                    self.inner
+                        .completed_receive_destinations
+                        .write()
+                        .await
+                        .remove(&transfer_id);
                 }
                 self.cleanup_attempt(transfer_id, false).await;
             }
@@ -1682,6 +1708,10 @@ exit 0"#,
         assert_eq!(
             manager.session(transfer_id).await.unwrap().state,
             TransferState::Completed
+        );
+        assert_eq!(
+            manager.completed_receive_destination(transfer_id).await,
+            Some(root.clone())
         );
 
         let _ = std::fs::remove_file(script);

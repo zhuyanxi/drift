@@ -1,5 +1,6 @@
 use drift_app::{
-    logging, AppReceiveController, AppSendController, AppSettingsController, AppState,
+    logging, AppReceiveController, AppSendController, AppSettingsController,
+    AppTransferController, AppState,
 };
 
 fn main() {
@@ -13,10 +14,11 @@ fn main() {
                 "drift services initialized"
             );
             let handle = app_state.handle();
-            drift_ui::run_with_controllers_and_settings(
+            drift_ui::run_with_controllers_and_settings_and_transfers(
                 std::sync::Arc::new(AppSendController::new(handle.clone())),
                 std::sync::Arc::new(AppReceiveController::new(handle.clone())),
-                std::sync::Arc::new(AppSettingsController::new(handle)),
+                std::sync::Arc::new(AppSettingsController::new(handle.clone())),
+                std::sync::Arc::new(AppTransferController::new(handle)),
             );
             return;
         }

@@ -1,4 +1,5 @@
 pub mod logging;
+mod platform;
 pub mod settings;
 
 mod app_state;
@@ -7,4 +8,6 @@ mod ui_bridge;
 
 pub use app_state::{AppCommand, AppCommandError, AppError, AppHandle, AppState};
 pub use event_bridge::{AppTransferUpdate, TransferPresentation};
-pub use ui_bridge::{AppReceiveController, AppSendController, AppSettingsController};
+pub use ui_bridge::{
+	AppReceiveController, AppSendController, AppSettingsController, AppTransferController,
+};

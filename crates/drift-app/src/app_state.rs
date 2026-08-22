@@ -1,4 +1,5 @@
 use crate::event_bridge::{AppEventBridge, AppTransferUpdate, TransferPresentation};
+use crate::platform::{DestinationRevealer, RevealError, SystemDestinationRevealer};
 use crate::settings::{
     ConfigPathError, DriftSettings, RelaySettings, SettingsError, SettingsLoader, SettingsSource,
     SettingsStore,
@@ -6,7 +7,7 @@ use crate::settings::{
 use drift_core::{
     ResumeRequest, ResumeState, TransferCapability, TransferError, TransferId, TransferManifest,
 };
-use drift_protocol::{BackendError, CrocBackend, ReceiveRequest, SendRequest};
+use drift_protocol::{BackendCapabilities, BackendError, CrocBackend, ReceiveRequest, SendRequest};
 use drift_storage::{
     scan_send_paths, validate_receive_directory, DestinationError, JsonStore, ResumeDiscovery,
     StorageError,
@@ -15,6 +16,7 @@ use drift_transfer::TransferManager;
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use thiserror::Error;
 use tokio::{
@@ -54,6 +56,7 @@ pub struct AppState {
     event_bridge: AppEventBridge,
     resume_store: JsonStore,
     settings_store: SettingsStore,
+    destination_revealer: Arc<dyn DestinationRevealer>,
     runtime: Runtime,
 }
 
@@ -104,6 +107,7 @@ impl AppState {
             resume_store: self.resume_store.clone(),
             settings_store: self.settings_store.clone(),
             default_receive_directory: self.settings.transfer.default_receive_directory.clone(),
+            destination_revealer: Arc::clone(&self.destination_revealer),
         }
     }
 
@@ -130,6 +134,7 @@ impl AppState {
             event_bridge,
             resume_store,
             settings_store,
+            destination_revealer: Arc::new(SystemDestinationRevealer),
             runtime,
         })
     }
@@ -144,6 +149,7 @@ pub struct AppHandle {
     resume_store: JsonStore,
     settings_store: SettingsStore,
     default_receive_directory: PathBuf,
+    destination_revealer: Arc<dyn DestinationRevealer>,
 }
 
 impl AppHandle {
@@ -160,6 +166,47 @@ impl AppHandle {
 
     pub fn default_receive_directory(&self) -> PathBuf {
         self.default_receive_directory.clone()
+    }
+
+    pub fn backend_capabilities(&self) -> BackendCapabilities {
+        self.transfer_manager.capabilities()
+    }
+
+    pub fn relay_configured(&self) -> Option<bool> {
+        self.settings_store
+            .snapshot()
+            .ok()
+            .map(|settings| settings.relay.effective_url().is_some())
+    }
+
+    pub async fn sessions(&self) -> Vec<drift_core::TransferSession> {
+        self.transfer_manager.sessions().await
+    }
+
+    pub async fn destination_available(&self, transfer_id: TransferId) -> bool {
+        self.transfer_manager
+            .completed_receive_destination(transfer_id)
+            .await
+            .is_some()
+    }
+
+    pub fn reveal_destination(
+        &self,
+        transfer_id: TransferId,
+    ) -> JoinHandle<Result<TransferId, AppCommandError>> {
+        let transfer_manager = self.transfer_manager.clone();
+        let revealer = Arc::clone(&self.destination_revealer);
+        self.runtime.spawn(async move {
+            let destination = transfer_manager
+                .completed_receive_destination(transfer_id)
+                .await
+                .ok_or(AppCommandError::DestinationUnavailable)?;
+            revealer
+                .reveal(destination)
+                .await
+                .map_err(AppCommandError::from)?;
+            Ok(transfer_id)
+        })
     }
 
     pub fn settings(&self) -> JoinHandle<Result<DriftSettings, AppCommandError>> {
@@ -334,6 +381,10 @@ pub enum AppCommandError {
     OutputDirectoryUnavailable,
     #[error("output directory is not writable")]
     OutputDirectoryNotWritable,
+    #[error("completed receive destination is unavailable")]
+    DestinationUnavailable,
+    #[error("completed receive destination could not be revealed")]
+    RevealFailed,
     #[error("transfer code must not be empty")]
     EmptyTransferCode,
     #[error("transfer command failed")]
@@ -358,6 +409,8 @@ impl AppCommandError {
             Self::EmptyOutputDirectory => "The receive folder is unavailable.",
             Self::OutputDirectoryUnavailable => "The receive folder is unavailable.",
             Self::OutputDirectoryNotWritable => "The receive folder is not writable.",
+            Self::DestinationUnavailable => "The completed receive destination is unavailable.",
+            Self::RevealFailed => "The completed receive destination could not be revealed.",
             Self::EmptyTransferCode => "Enter a transfer code.",
             Self::Transfer(TransferError::CapabilityUnavailable(TransferCapability::Pause)) => {
                 "Pause is unavailable for this backend."
@@ -401,6 +454,14 @@ impl From<DestinationError> for AppCommandError {
 impl From<StorageError> for AppCommandError {
     fn from(error: StorageError) -> Self {
         Self::RecoveryStorage(error)
+    }
+}
+
+impl From<RevealError> for AppCommandError {
+    fn from(error: RevealError) -> Self {
+        match error {
+            RevealError::Unsupported | RevealError::Failed => Self::RevealFailed,
+        }
     }
 }
 
@@ -779,6 +840,19 @@ mod tests {
             "Pause is unavailable for this backend."
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reveal_errors_have_safe_user_messages() {
+        let unsupported = AppCommandError::from(RevealError::Unsupported);
+        let failed = AppCommandError::from(RevealError::Failed);
+
+        assert!(matches!(unsupported, AppCommandError::RevealFailed));
+        assert!(matches!(failed, AppCommandError::RevealFailed));
+        assert_eq!(
+            failed.user_message(),
+            "The completed receive destination could not be revealed."
+        );
     }
 
     #[test]

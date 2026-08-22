@@ -1,16 +1,20 @@
-use crate::event_bridge::AppTransferUpdate;
+use crate::event_bridge::{AppTransferUpdate, TransferPresentation};
 use crate::settings::{RelaySettings, SettingsError, SettingsValidationError};
 use crate::{AppCommand, AppCommandError, AppHandle};
 use drift_core::{
     ResumeRequest, Role, TransferCapability, TransferEvent, TransferId, TransferManifest,
 };
+use drift_protocol::BackendCapability;
 use drift_storage::{scan_send_paths, ScanCancellation, SourceScan, SourceScanError};
 use drift_ui::{
-    ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture, ReceiveEventStream,
-    ReceiveFuture, RecoveryCandidate, RecoveryKind, RelaySettingsSnapshot, SelectedItem,
-    SendCommandError, SendCommandErrorKind, SendController, SendEvent, SendEventFuture,
-    SendEventStream, SendFuture, SendProgress, SendSelection, SettingsCommandError,
-    SettingsCommandErrorKind, SettingsController, SettingsFuture,
+    failure_label, ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture,
+    ReceiveEventStream, ReceiveFuture, RecoveryCandidate, RecoveryKind, RelaySettingsSnapshot,
+    SelectedItem, SendCommandError, SendCommandErrorKind, SendController, SendEvent,
+    SendEventFuture, SendEventStream, SendFuture, SendProgress, SendSelection,
+    SettingsCommandError, SettingsCommandErrorKind, SettingsController, SettingsFuture,
+    RelayStatus, TransferCommandError, TransferCommandErrorKind, TransferCommandFuture,
+    TransferController, TransferEventFuture, TransferEventStream, TransferListFuture,
+    TransferSnapshot,
 };
 use std::{
     future::Future,
@@ -198,6 +202,200 @@ fn map_source_scan_error(error: SourceScanError) -> SendCommandError {
 #[derive(Clone)]
 pub struct AppReceiveController {
     handle: AppHandle,
+}
+
+#[derive(Clone)]
+pub struct AppTransferController {
+    handle: AppHandle,
+}
+
+impl AppTransferController {
+    pub fn new(handle: AppHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl TransferController for AppTransferController {
+    fn load(&self) -> TransferListFuture {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            let sessions = handle.sessions().await;
+            let mut snapshots = Vec::with_capacity(sessions.len());
+            for session in sessions {
+                let presentation = handle.presentation(session.id).await.unwrap_or_else(|| {
+                    TransferPresentation {
+                        transfer_id: session.id,
+                        role: session.role,
+                        state: session.state,
+                        progress: session.progress,
+                        code_available: session.code.is_some(),
+                        error: session.error.clone(),
+                        failure_kind: session.failure_kind,
+                    }
+                });
+                snapshots.push(transfer_snapshot(&handle, presentation, Some(session)).await);
+            }
+            Ok(snapshots)
+        })
+    }
+
+    fn cancel(&self, transfer_id: TransferId) -> TransferCommandFuture {
+        app_transfer_command(&self.handle, AppCommand::Cancel { transfer_id })
+    }
+
+    fn retry(&self, transfer_id: TransferId) -> TransferCommandFuture {
+        app_transfer_command(&self.handle, AppCommand::RetryTransfer { transfer_id })
+    }
+
+    fn pause(&self, transfer_id: TransferId) -> TransferCommandFuture {
+        app_transfer_command(&self.handle, AppCommand::PauseTransfer { transfer_id })
+    }
+
+    fn resume(&self, transfer_id: TransferId) -> TransferCommandFuture {
+        app_transfer_command(&self.handle, AppCommand::ResumeTransfer { transfer_id })
+    }
+
+    fn reveal_destination(&self, transfer_id: TransferId) -> TransferCommandFuture {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            match handle.reveal_destination(transfer_id).await {
+                Ok(Ok(transfer_id)) => Ok(transfer_id),
+                Ok(Err(AppCommandError::DestinationUnavailable)) => Err(
+                    TransferCommandError::new(TransferCommandErrorKind::DestinationUnavailable),
+                ),
+                Ok(Err(_)) => Err(TransferCommandError::new(TransferCommandErrorKind::Failed)),
+                Err(_) => Err(TransferCommandError::new(
+                    TransferCommandErrorKind::Unavailable,
+                )),
+            }
+        })
+    }
+
+    fn subscribe(&self) -> Box<dyn TransferEventStream> {
+        Box::new(AppTransferEventStream {
+            handle: self.handle.clone(),
+            receiver: self.handle.subscribe(),
+        })
+    }
+}
+
+fn app_transfer_command(handle: &AppHandle, command: AppCommand) -> TransferCommandFuture {
+    let handle = handle.clone();
+    Box::pin(async move {
+        match handle.dispatch(command).await {
+            Ok(Ok(transfer_id)) => Ok(transfer_id),
+            Ok(Err(error)) => Err(map_transfer_command_error(&error)),
+            Err(_) => Err(TransferCommandError::new(
+                TransferCommandErrorKind::Unavailable,
+            )),
+        }
+    })
+}
+
+fn map_transfer_command_error(error: &AppCommandError) -> TransferCommandError {
+    let kind = match error {
+        AppCommandError::Transfer(drift_core::TransferError::CapabilityUnavailable(_)) => {
+            TransferCommandErrorKind::Unsupported
+        }
+        AppCommandError::RecoveryUnavailable | AppCommandError::RecoveryInvalid => {
+            TransferCommandErrorKind::Failed
+        }
+        _ => TransferCommandErrorKind::Failed,
+    };
+    TransferCommandError::new(kind)
+}
+
+struct AppTransferEventStream {
+    handle: AppHandle,
+    receiver: broadcast::Receiver<AppTransferUpdate>,
+}
+
+impl TransferEventStream for AppTransferEventStream {
+    fn next(&mut self) -> TransferEventFuture<'_> {
+        Box::pin(async move {
+            loop {
+                let update = match self.receiver.recv().await {
+                    Ok(update) => update,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "transfer UI event stream lagged");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                };
+                return Some(transfer_snapshot(&self.handle, update.presentation, None).await);
+            }
+        })
+    }
+}
+
+async fn transfer_snapshot(
+    handle: &AppHandle,
+    presentation: TransferPresentation,
+    session: Option<drift_core::TransferSession>,
+) -> TransferSnapshot {
+    let session = match session {
+        Some(session) => Some(session),
+        None => handle.session(presentation.transfer_id).await,
+    };
+    let manifest = session.as_ref().and_then(|session| session.manifest.as_ref());
+    let display_name = manifest
+        .and_then(|manifest| manifest.files.first())
+        .and_then(|file| file.relative_path.file_name())
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
+    let file_count = manifest.map(|manifest| manifest.files.len());
+    let capabilities = handle.backend_capabilities();
+    let relay = match handle.relay_configured() {
+        Some(true) => RelayStatus::Custom,
+        Some(false) => RelayStatus::Default,
+        None => RelayStatus::Unknown,
+    };
+    let retryable = presentation.retryable();
+    let error = safe_failure_message(
+        presentation.state,
+        presentation.failure_kind,
+        retryable,
+        "The transfer failed.",
+    );
+    TransferSnapshot {
+        transfer_id: presentation.transfer_id,
+        role: presentation.role,
+        state: presentation.state,
+        progress: presentation.progress,
+        progress_supported: capabilities.supports(BackendCapability::Progress),
+        pause_supported: capabilities.supports(BackendCapability::Pause),
+        resume_supported: capabilities.supports(BackendCapability::Resume),
+        retryable,
+        display_name,
+        file_count,
+        relay,
+        error,
+        destination_available: presentation.state == drift_core::TransferState::Completed
+            && presentation.role == drift_core::Role::Receiver
+            && handle
+                .destination_available(presentation.transfer_id)
+                .await,
+    }
+}
+
+fn safe_failure_message(
+    state: drift_core::TransferState,
+    failure_kind: Option<drift_core::TransferFailureKind>,
+    retryable: bool,
+    fallback: &'static str,
+) -> Option<String> {
+    if state != drift_core::TransferState::Failed {
+        return None;
+    }
+    Some(
+        failure_label(failure_kind)
+            .unwrap_or(if retryable {
+                "The transfer stopped unexpectedly. Retry is available."
+            } else {
+                fallback
+            })
+            .to_owned(),
+    )
 }
 
 #[derive(Clone)]
@@ -533,9 +731,13 @@ fn map_notification(
             TransferEvent::Completed => SendEvent::Completed { transfer_id },
             TransferEvent::Failed => SendEvent::Failed {
                 transfer_id,
-                message: presentation
-                    .error
-                    .unwrap_or_else(|| "The transfer failed.".to_owned()),
+                message: safe_failure_message(
+                    presentation.state,
+                    presentation.failure_kind,
+                    retryable,
+                    "The transfer failed.",
+                )
+                .unwrap_or_else(|| "The transfer failed.".to_owned()),
                 retryable,
             },
             TransferEvent::Cancelled => SendEvent::Cancelled { transfer_id },
@@ -590,9 +792,13 @@ fn map_receive_notification(
             TransferEvent::Completed => ReceiveEvent::Completed { transfer_id },
             TransferEvent::Failed => ReceiveEvent::Failed {
                 transfer_id,
-                message: presentation
-                    .error
-                    .unwrap_or_else(|| "The receive transfer failed.".to_owned()),
+                message: safe_failure_message(
+                    presentation.state,
+                    presentation.failure_kind,
+                    retryable,
+                    "The receive transfer failed.",
+                )
+                .unwrap_or_else(|| "The receive transfer failed.".to_owned()),
                 retryable,
             },
             TransferEvent::Cancelled => ReceiveEvent::Cancelled { transfer_id },
@@ -610,6 +816,7 @@ type _SendEventFutureCheck<'a> = Pin<Box<dyn Future<Output = Option<SendEvent>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use drift_core::{FileEntry, TransferFailureKind, TransferManifest, TransferSession, TransferState};
     use drift_ui::{ReceiveEvent, SendEvent, SettingsCommandErrorKind, SettingsController};
     use std::fs;
     use uuid::Uuid;
@@ -671,6 +878,56 @@ mod tests {
                 .relay,
             settings.relay
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transfer_snapshot_exposes_safe_metadata_and_backend_capabilities() {
+        let root = std::env::temp_dir().join(format!("drift-app-ui-transfer-{}", Uuid::new_v4()));
+        let config_path = root.join("config").join("config.json");
+        crate::settings::SettingsLoader::with_path(&config_path)
+            .save(&crate::settings::DriftSettings::default())
+            .unwrap();
+        let state = crate::AppState::bootstrap_with_config_path(&config_path).unwrap();
+        let handle = state.handle();
+        let mut session = TransferSession::new(drift_core::Role::Sender, "croc");
+        let manifest = TransferManifest::new(
+            session.id,
+            vec![FileEntry::new("nested/private.txt", 7).unwrap()],
+        )
+        .unwrap();
+        session.set_manifest(manifest);
+        session.state = TransferState::Failed;
+        let presentation = TransferPresentation {
+            transfer_id: session.id,
+            role: session.role,
+            state: TransferState::Failed,
+            progress: session.progress,
+            code_available: false,
+            error: Some("/private/path/raw backend output".into()),
+            failure_kind: Some(TransferFailureKind::ProcessFailure),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let snapshot = runtime.block_on(transfer_snapshot(&handle, presentation, Some(session)));
+
+        assert_eq!(snapshot.display_name.as_deref(), Some("private.txt"));
+        assert_eq!(snapshot.file_count, Some(1));
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("Croc could not complete the transfer.")
+        );
+        assert!(!snapshot
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("raw backend output"));
+        assert!(!snapshot.progress_supported);
+        assert!(!snapshot.pause_supported);
+        assert!(!snapshot.resume_supported);
         fs::remove_dir_all(root).unwrap();
     }
 }

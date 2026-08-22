@@ -2,6 +2,7 @@ mod send;
 mod receive;
 mod progress;
 mod settings;
+mod transfer;
 
 pub use receive::{
     ReceiveAction, ReceiveCommandError, ReceiveCommandErrorKind, ReceiveController, ReceiveEvent,
@@ -16,6 +17,12 @@ pub use send::{
 pub use settings::{
     RelaySettingsSnapshot, SettingsAction, SettingsCommandError, SettingsCommandErrorKind,
     SettingsController, SettingsFuture, SettingsIntent, SettingsPhase, SettingsViewState,
+};
+pub use transfer::{
+    failure_label, RelayStatus, TransferAction, TransferCommandError, TransferCommandErrorKind,
+    TransferCommandFuture, TransferController, TransferDetail, TransferDirection,
+    TransferEventFuture, TransferEventStream, TransferListModel, TransferListState,
+    TransferListFuture, TransferSnapshot, TransferSummary, TransferControls,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +53,9 @@ mod gui {
         ReceivePhase, ReceiveViewState, RecoveryCandidate, RecoveryKind, SendAction,
         SendCommandError, SendController, SendEventStream, SendIntent, SendPhase, SendViewState,
         RelaySettingsSnapshot, SettingsAction, SettingsCommandError, SettingsCommandErrorKind,
-        SettingsController, SettingsFuture, SettingsIntent, SettingsViewState,
+        SettingsController, SettingsFuture, SettingsIntent, SettingsViewState, TransferAction,
+        TransferCommandError, TransferCommandErrorKind, TransferController, TransferEventStream,
+        TransferListModel,
     };
 
     actions!(
@@ -64,7 +73,10 @@ mod gui {
             DiscardReceiveRecovery
         ]
     );
-    actions!(navigation, [ShowSend, ShowReceive, ShowSettings]);
+    actions!(
+        navigation,
+        [ShowHome, ShowSend, ShowReceive, ShowTransfers, ShowSettings]
+    );
 
     trait ClipboardService: Send + Sync {
         fn copy(&self, value: &str, cx: &mut App) -> Result<(), ()>;
@@ -194,6 +206,61 @@ mod gui {
         }
     }
 
+    struct UnavailableTransferController;
+
+    impl TransferController for UnavailableTransferController {
+        fn cancel(
+            &self,
+            _transfer_id: drift_core::TransferId,
+        ) -> super::TransferCommandFuture {
+            Box::pin(async {
+                Err(TransferCommandError::new(
+                    TransferCommandErrorKind::Unavailable,
+                ))
+            })
+        }
+
+        fn retry(
+            &self,
+            transfer_id: drift_core::TransferId,
+        ) -> super::TransferCommandFuture {
+            self.cancel(transfer_id)
+        }
+
+        fn pause(
+            &self,
+            transfer_id: drift_core::TransferId,
+        ) -> super::TransferCommandFuture {
+            self.cancel(transfer_id)
+        }
+
+        fn resume(
+            &self,
+            transfer_id: drift_core::TransferId,
+        ) -> super::TransferCommandFuture {
+            self.cancel(transfer_id)
+        }
+
+        fn reveal_destination(
+            &self,
+            transfer_id: drift_core::TransferId,
+        ) -> super::TransferCommandFuture {
+            self.cancel(transfer_id)
+        }
+
+        fn subscribe(&self) -> Box<dyn TransferEventStream> {
+            Box::new(EmptyTransferEventStream)
+        }
+    }
+
+    struct EmptyTransferEventStream;
+
+    impl TransferEventStream for EmptyTransferEventStream {
+        fn next(&mut self) -> super::TransferEventFuture<'_> {
+            Box::pin(async { None })
+        }
+    }
+
     struct UnavailableSettingsController;
 
     impl SettingsController for UnavailableSettingsController {
@@ -228,8 +295,10 @@ mod gui {
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MainRoute {
+        Home,
         Send,
         Receive,
+        Transfers,
         Settings,
     }
 
@@ -239,19 +308,25 @@ mod gui {
         send: SendViewState,
         receive: ReceiveViewState,
         settings: SettingsViewState,
+        transfers: TransferListModel,
         controller: Arc<dyn SendController>,
         receive_controller: Arc<dyn ReceiveController>,
         settings_controller: Arc<dyn SettingsController>,
+        transfer_controller: Arc<dyn TransferController>,
         clipboard: Arc<dyn ClipboardService>,
         path_picker: Arc<dyn SendPathPicker>,
         receive_focus: FocusHandle,
         settings_focus: FocusHandle,
         _send_event_task: Task<()>,
         _receive_event_task: Task<()>,
+        _transfer_event_task: Task<()>,
+        _transfer_load_task: Task<()>,
         _recovery_task: Task<()>,
         _settings_task: Task<()>,
         recovery_candidates: Vec<RecoveryCandidate>,
         command_task: Option<Task<()>>,
+        transfer_command_error: Option<String>,
+        pending_transfer_selection: Option<drift_core::TransferId>,
     }
 
     impl MainView {
@@ -260,6 +335,7 @@ mod gui {
             controller: Arc<dyn SendController>,
             receive_controller: Arc<dyn ReceiveController>,
             settings_controller: Arc<dyn SettingsController>,
+            transfer_controller: Arc<dyn TransferController>,
             cx: &mut Context<Self>,
         ) -> Self {
             Self::new_with_clipboard(
@@ -267,6 +343,7 @@ mod gui {
                 controller,
                 receive_controller,
                 settings_controller,
+                transfer_controller,
                 Arc::new(GpuiClipboard),
                 cx,
             )
@@ -277,6 +354,7 @@ mod gui {
             controller: Arc<dyn SendController>,
             receive_controller: Arc<dyn ReceiveController>,
             settings_controller: Arc<dyn SettingsController>,
+            transfer_controller: Arc<dyn TransferController>,
             clipboard: Arc<dyn ClipboardService>,
             cx: &mut Context<Self>,
         ) -> Self {
@@ -310,6 +388,44 @@ mod gui {
                         }
                     }
                 });
+            let mut transfer_event_stream = transfer_controller.subscribe();
+            let transfer_event_task =
+                cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    while let Some(snapshot) = transfer_event_stream.next().await {
+                        if this
+                            .update(&mut *cx, |view, cx| {
+                                let transfer_id = snapshot.transfer_id;
+                                view.transfers.upsert(snapshot);
+                                if view.pending_transfer_selection == Some(transfer_id) {
+                                    view.transfers.select(Some(transfer_id));
+                                    view.pending_transfer_selection = None;
+                                }
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            let transfer_controller_for_load = Arc::clone(&transfer_controller);
+            let transfer_load_task = cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    let result = transfer_controller_for_load.load().await;
+                    let _ = this.update(&mut *cx, |view, cx| {
+                        match result {
+                            Ok(snapshots) => {
+                                view.transfers.set_loading(false);
+                                for snapshot in snapshots {
+                                    view.transfers.upsert(snapshot);
+                                }
+                            }
+                            Err(error) => view.transfers.set_error(Some(error.message())),
+                        }
+                        cx.notify();
+                    });
+                },
+            );
             let receive = ReceiveViewState::new(receive_controller.default_destination());
             let recovery_controller = Arc::clone(&controller);
             let recovery_task = cx.spawn(
@@ -320,6 +436,7 @@ mod gui {
                         .unwrap_or_default();
                     let _ = this.update(&mut *cx, |view, cx| {
                         view.recovery_candidates = candidates;
+                        view.transfers.replace_recoveries(&view.recovery_candidates);
                         cx.notify();
                     });
                 },
@@ -358,25 +475,33 @@ mod gui {
                     });
                 },
             );
+            let mut transfers = TransferListModel::default();
+            transfers.set_loading(true);
             Self {
                 startup_error,
-                route: MainRoute::Send,
+                route: MainRoute::Home,
                 send: SendViewState::new(),
                 receive,
                 settings: SettingsViewState::new(),
+                transfers,
                 controller,
                 receive_controller,
                 settings_controller,
+                transfer_controller,
                 clipboard,
                 path_picker: Arc::new(GpuiSendPathPicker),
                 receive_focus: cx.focus_handle(),
                 settings_focus: cx.focus_handle(),
                 _send_event_task: send_event_task,
                 _receive_event_task: receive_event_task,
+                _transfer_event_task: transfer_event_task,
+                _transfer_load_task: transfer_load_task,
                 _recovery_task: recovery_task,
                 _settings_task: settings_task,
                 recovery_candidates: Vec::new(),
                 command_task: initial_command_task,
+                transfer_command_error: None,
+                pending_transfer_selection: None,
             }
         }
 
@@ -416,6 +541,69 @@ mod gui {
             };
             cx.notify();
             self.run_receive_intent(intent, cx);
+        }
+
+        fn dispatch_transfer_action(&mut self, action: TransferAction, cx: &mut Context<Self>) {
+            let Some(transfer_id) = self.transfers.selected() else {
+                return;
+            };
+            let Some(detail) = self.transfers.selected_detail() else {
+                return;
+            };
+            let enabled = match action {
+                TransferAction::Cancel => detail.summary.controls.cancel,
+                TransferAction::Retry => detail.summary.controls.retry,
+                TransferAction::Pause => detail.summary.controls.pause,
+                TransferAction::Resume => detail.summary.controls.resume,
+                TransferAction::RevealDestination => detail.summary.controls.reveal_destination,
+            };
+            if !enabled {
+                return;
+            }
+            self.transfer_command_error = None;
+            let controller = Arc::clone(&self.transfer_controller);
+            self.command_task = Some(cx.spawn(
+                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    let result = match action {
+                        TransferAction::Cancel => controller.cancel(transfer_id).await,
+                        TransferAction::Retry => controller.retry(transfer_id).await,
+                        TransferAction::Pause => controller.pause(transfer_id).await,
+                        TransferAction::Resume => controller.resume(transfer_id).await,
+                        TransferAction::RevealDestination => {
+                            controller.reveal_destination(transfer_id).await
+                        }
+                    };
+                    let _ = this.update(&mut *cx, |view, cx| {
+                        match result {
+                            Ok(new_transfer_id) if action == TransferAction::Retry => {
+                                view.transfers.remove(transfer_id);
+                                if view
+                                    .transfers
+                                    .rows()
+                                    .iter()
+                                    .any(|row| row.transfer_id == new_transfer_id)
+                                {
+                                    view.transfers.select(Some(new_transfer_id));
+                                } else {
+                                    view.pending_transfer_selection = Some(new_transfer_id);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                view.transfer_command_error = Some(error.message().to_owned());
+                            }
+                        }
+                        cx.notify();
+                    });
+                },
+            ));
+            cx.notify();
+        }
+
+        fn remove_recovery_candidate(&mut self, transfer_id: drift_core::TransferId) {
+            self.recovery_candidates
+                .retain(|candidate| candidate.transfer_id != transfer_id);
+            self.transfers.remove_recovery(transfer_id);
         }
 
         fn run_receive_intent(&mut self, intent: ReceiveIntent, cx: &mut Context<Self>) {
@@ -558,8 +746,7 @@ mod gui {
                         Ok(new_transfer_id) => {
                             let _ = this.update(&mut *cx, |view, cx| {
                                 view.send.mark_start_succeeded(new_transfer_id);
-                                view.recovery_candidates
-                                    .retain(|candidate| candidate.transfer_id != transfer_id);
+                                view.remove_recovery_candidate(transfer_id);
                                 cx.notify();
                             });
                         }
@@ -584,8 +771,7 @@ mod gui {
                 async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
                     if controller.discard_recovery(transfer_id).await.is_ok() {
                         let _ = this.update(&mut *cx, |view, cx| {
-                            view.recovery_candidates
-                                .retain(|candidate| candidate.transfer_id != transfer_id);
+                            view.remove_recovery_candidate(transfer_id);
                             cx.notify();
                         });
                     }
@@ -674,8 +860,7 @@ mod gui {
                         Ok(new_transfer_id) => {
                             let _ = this.update(&mut *cx, |view, cx| {
                                 view.receive.mark_start_succeeded(new_transfer_id);
-                                view.recovery_candidates
-                                    .retain(|candidate| candidate.transfer_id != transfer_id);
+                                view.remove_recovery_candidate(transfer_id);
                                 cx.notify();
                             });
                         }
@@ -700,8 +885,7 @@ mod gui {
                 async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
                     if controller.discard_recovery(transfer_id).await.is_ok() {
                         let _ = this.update(&mut *cx, |view, cx| {
-                            view.recovery_candidates
-                                .retain(|candidate| candidate.transfer_id != transfer_id);
+                            view.remove_recovery_candidate(transfer_id);
                             cx.notify();
                         });
                     }
@@ -1046,6 +1230,272 @@ mod gui {
                 .into_any_element()
         }
 
+        fn render_home(&mut self, cx: &mut Context<Self>) -> AnyElement {
+            let active_count = self
+                .transfers
+                .rows()
+                .iter()
+                .filter(|row| {
+                    !matches!(
+                        row.state,
+                        drift_core::TransferState::Completed
+                            | drift_core::TransferState::Failed
+                            | drift_core::TransferState::Cancelled
+                    )
+                })
+                .count();
+            let transfer_count = self.transfers.rows().len();
+            let send = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.route = MainRoute::Send;
+                cx.notify();
+            });
+            let receive = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.route = MainRoute::Receive;
+                cx.notify();
+            });
+            let transfers = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.route = MainRoute::Transfers;
+                cx.notify();
+            });
+            div()
+                .id("home-view")
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowSend, _, cx| {
+                    view.route = MainRoute::Send;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowReceive, _, cx| {
+                    view.route = MainRoute::Receive;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
+                    view.route = MainRoute::Transfers;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowSettings, _, cx| {
+                    view.route = MainRoute::Settings;
+                    cx.notify();
+                }))
+                .size_full()
+                .p_8()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .bg(gpui::rgb(0xf7f4ee))
+                .text_color(gpui::rgb(0x1d2a24))
+                .child(div().child("Home"))
+                .child(self.render_navigation(cx))
+                .child(div().child(format!("{active_count} active transfer(s)")))
+                .child(div().child(format!("{transfer_count} transfer(s) in this session")))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(action_button("home-send", "Send files", true, send))
+                        .child(action_button("home-receive", "Receive files", true, receive))
+                        .child(action_button(
+                            "home-transfers",
+                            "View transfers",
+                            true,
+                            transfers,
+                        )),
+                )
+                .into_any_element()
+        }
+
+        fn render_transfers(&mut self, cx: &mut Context<Self>) -> AnyElement {
+            let rows = self.transfers.rows().to_vec();
+            let selected = self.transfers.selected();
+            let mut list = div().flex().flex_col().gap_2();
+            for row in rows {
+                let transfer_id = row.transfer_id;
+                let is_selected = selected == Some(transfer_id);
+                let recovery_available = row.recovery_available;
+                let recovery_route = row.direction;
+                let select = cx.listener(move |view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.transfers.select(Some(transfer_id));
+                    if recovery_available {
+                        view.route = match recovery_route {
+                            super::TransferDirection::Sending => MainRoute::Send,
+                            super::TransferDirection::Receiving => MainRoute::Receive,
+                        };
+                    }
+                    cx.notify();
+                });
+                let progress = if !row.progress_supported {
+                    "Progress unavailable".to_owned()
+                } else {
+                    format_progress(
+                        row.progress.transferred_bytes,
+                        row.progress.total_bytes,
+                        row.speed_bps,
+                        row.eta_seconds,
+                    )
+                };
+                let mut row_view = div()
+                    .id(SharedString::from(format!("transfer-row-{transfer_id}")))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_4()
+                    .border_1()
+                    .border_color(gpui::rgb(0xd7d0c4))
+                    .rounded_sm()
+                    .bg(gpui::rgb(0xffffff))
+                    .on_click(select)
+                    .child(format!(
+                        "{} | {} | {}",
+                        row.direction.label(),
+                        row.display_name,
+                        row.file_count_label()
+                    ))
+                    .child(format!("{} | {}", row.state_label(), progress))
+                    .child(row.relay.label());
+                if let Some(error) = row.error {
+                    row_view = row_view
+                        .text_color(gpui::rgb(0x9a3025))
+                        .child(error);
+                }
+                if row.recovery_available {
+                    row_view = row_view.child("Recovery available");
+                }
+                if is_selected {
+                    row_view = row_view.border_color(gpui::rgb(0x235347));
+                }
+                list = list.child(row_view);
+            }
+
+            let mut detail = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_4()
+                .border_1()
+                .border_color(gpui::rgb(0xd7d0c4))
+                .rounded_sm()
+                .bg(gpui::rgb(0xffffff));
+            if let Some(detail_state) = self.transfers.selected_detail() {
+                let summary = detail_state.summary;
+                let cancel = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_transfer_action(TransferAction::Cancel, cx);
+                });
+                let retry = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_transfer_action(TransferAction::Retry, cx);
+                });
+                let pause = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_transfer_action(TransferAction::Pause, cx);
+                });
+                let resume = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_transfer_action(TransferAction::Resume, cx);
+                });
+                let reveal = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                    view.dispatch_transfer_action(TransferAction::RevealDestination, cx);
+                });
+                detail = detail
+                    .child("Selected transfer")
+                    .child(format!("{}: {}", summary.direction.label(), summary.display_name))
+                    .child(summary.state_label())
+                    .child(summary.file_count_label())
+                    .child(if summary.progress_supported {
+                        format_progress(
+                            summary.progress.transferred_bytes,
+                            summary.progress.total_bytes,
+                            summary.speed_bps,
+                            summary.eta_seconds,
+                        )
+                    } else {
+                        "Progress unavailable".to_owned()
+                    })
+                    .child(format!("Relay: {}", summary.relay.label()))
+                    .child(action_button(
+                        "transfer-cancel",
+                        "Cancel",
+                        summary.controls.cancel,
+                        cancel,
+                    ))
+                    .child(action_button(
+                        "transfer-retry",
+                        "Retry",
+                        summary.controls.retry,
+                        retry,
+                    ))
+                    .child(action_button(
+                        "transfer-pause",
+                        "Pause",
+                        summary.controls.pause,
+                        pause,
+                    ))
+                    .child(action_button(
+                        "transfer-resume",
+                        "Resume",
+                        summary.controls.resume,
+                        resume,
+                    ))
+                    .child(action_button(
+                        "transfer-reveal",
+                        "Reveal destination",
+                        summary.controls.reveal_destination,
+                        reveal,
+                    ));
+                if let Some(error) = summary.error {
+                    detail = detail
+                        .text_color(gpui::rgb(0x9a3025))
+                        .child(error);
+                }
+            } else {
+                detail = detail.child("Select a transfer to view details.");
+            }
+            if let Some(error) = &self.transfer_command_error {
+                detail = detail
+                    .text_color(gpui::rgb(0x9a3025))
+                    .child(error.clone());
+            }
+
+            let mut root = div()
+                .id("transfers-view")
+                .key_context("TransfersView")
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowHome, _, cx| {
+                    view.route = MainRoute::Home;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowSend, _, cx| {
+                    view.route = MainRoute::Send;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowReceive, _, cx| {
+                    view.route = MainRoute::Receive;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowSettings, _, cx| {
+                    view.route = MainRoute::Settings;
+                    cx.notify();
+                }))
+                .size_full()
+                .p_8()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .bg(gpui::rgb(0xf7f4ee))
+                .text_color(gpui::rgb(0x1d2a24))
+                .child(div().child("Transfers"))
+                .child(self.render_navigation(cx));
+            match self.transfers.state() {
+                super::TransferListState::Empty => {
+                    root = root.child(div().child("No transfers in this session."));
+                }
+                super::TransferListState::Loading => {
+                    root = root.child(div().child("Loading transfers..."));
+                }
+                super::TransferListState::Error => {
+                    root = root.child(div().child("Transfers are unavailable."));
+                }
+                super::TransferListState::Ready | super::TransferListState::RecoveryAvailable => {
+                    root = root.child(list).child(detail);
+                }
+            }
+            root.into_any_element()
+        }
+
         fn render_send(&mut self, cx: &mut Context<Self>) -> AnyElement {
             let phase = self.send.phase();
             let selection = self.send.selection();
@@ -1148,6 +1598,10 @@ mod gui {
             let mut root = div()
                 .id("send-view")
                 .key_context("SendView")
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowHome, _, cx| {
+                    view.route = MainRoute::Home;
+                    cx.notify();
+                }))
                 .on_action(cx.listener(|view: &mut MainView, _: &ChooseFiles, _, cx| {
                     view.dispatch_action(SendAction::Choose, cx);
                 }))
@@ -1205,6 +1659,10 @@ mod gui {
                 }))
                 .on_action(cx.listener(|view: &mut MainView, _: &ShowSettings, _, cx| {
                     view.route = MainRoute::Settings;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
+                    view.route = MainRoute::Transfers;
                     cx.notify();
                 }))
                 .child(div().child("Send"))
@@ -1328,6 +1786,10 @@ mod gui {
             let mut root = div()
                 .id("settings-view")
                 .key_context("SettingsView")
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowHome, _, cx| {
+                    view.route = MainRoute::Home;
+                    cx.notify();
+                }))
                 .on_action(cx.listener(|view: &mut MainView, _: &ShowSend, _, cx| {
                     view.route = MainRoute::Send;
                     cx.notify();
@@ -1338,6 +1800,10 @@ mod gui {
                 }))
                 .on_action(cx.listener(|view: &mut MainView, _: &ShowReceive, _, cx| {
                     view.route = MainRoute::Receive;
+                    cx.notify();
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
+                    view.route = MainRoute::Transfers;
                     cx.notify();
                 }))
                 .size_full()
@@ -1478,6 +1944,10 @@ mod gui {
             let mut root = div()
                 .id("receive-view")
                 .key_context("ReceiveView")
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowHome, _, cx| {
+                    view.route = MainRoute::Home;
+                    cx.notify();
+                }))
                 .on_action(cx.listener(|view: &mut MainView, _: &ShowSend, _, cx| {
                     view.route = MainRoute::Send;
                     cx.notify();
@@ -1523,6 +1993,10 @@ mod gui {
                             cx,
                         );
                     }
+                }))
+                .on_action(cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
+                    view.route = MainRoute::Transfers;
+                    cx.notify();
                 }))
                 .size_full()
                 .p_8()
@@ -1636,12 +2110,20 @@ mod gui {
         }
 
         fn render_navigation(&mut self, cx: &mut Context<Self>) -> AnyElement {
+            let home = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.route = MainRoute::Home;
+                cx.notify();
+            });
             let send = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
                 view.route = MainRoute::Send;
                 cx.notify();
             });
             let receive = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
                 view.route = MainRoute::Receive;
+                cx.notify();
+            });
+            let transfers = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+                view.route = MainRoute::Transfers;
                 cx.notify();
             });
             let settings = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
@@ -1652,12 +2134,19 @@ mod gui {
                 .flex()
                 .items_center()
                 .gap_2()
+                .child(action_button("route-home", "Home", true, home))
                 .child(action_button("route-send", "Send", true, send))
                 .child(action_button(
                     "route-receive",
                     "Receive",
                     true,
                     receive,
+                ))
+                .child(action_button(
+                    "route-transfers",
+                    "Transfers",
+                    true,
+                    transfers,
                 ))
                 .child(action_button("route-settings", "Settings", true, settings))
                 .into_any_element()
@@ -1670,8 +2159,10 @@ mod gui {
                 self.render_error()
             } else {
                 match self.route {
+                    MainRoute::Home => self.render_home(cx),
                     MainRoute::Send => self.render_send(cx),
                     MainRoute::Receive => self.render_receive(cx),
+                    MainRoute::Transfers => self.render_transfers(cx),
                     MainRoute::Settings => self.render_settings(cx),
                 }
             }
@@ -1779,11 +2270,26 @@ mod gui {
         receive_controller: Arc<dyn ReceiveController>,
         settings_controller: Arc<dyn SettingsController>,
     ) {
+        run_with_controllers_and_settings_and_transfers(
+            controller,
+            receive_controller,
+            settings_controller,
+            Arc::new(UnavailableTransferController),
+        );
+    }
+
+    pub fn run_with_controllers_and_settings_and_transfers(
+        controller: Arc<dyn SendController>,
+        receive_controller: Arc<dyn ReceiveController>,
+        settings_controller: Arc<dyn SettingsController>,
+        transfer_controller: Arc<dyn TransferController>,
+    ) {
         run_with_startup_error_and_controllers(
             None,
             controller,
             receive_controller,
             settings_controller,
+            transfer_controller,
         );
     }
 
@@ -1793,6 +2299,7 @@ mod gui {
             Arc::new(UnavailableSendController),
             Arc::new(UnavailableReceiveController),
             Arc::new(UnavailableSettingsController),
+            Arc::new(UnavailableTransferController),
         );
     }
 
@@ -1801,6 +2308,7 @@ mod gui {
         controller: Arc<dyn SendController>,
         receive_controller: Arc<dyn ReceiveController>,
         settings_controller: Arc<dyn SettingsController>,
+        transfer_controller: Arc<dyn TransferController>,
     ) {
         Application::new().run(move |cx: &mut App| {
             cx.bind_keys([
@@ -1819,6 +2327,7 @@ mod gui {
                         controller,
                         receive_controller,
                         settings_controller,
+                        transfer_controller,
                         cx,
                     )
                 })
@@ -1836,7 +2345,7 @@ mod gui {
 #[cfg(feature = "gui")]
 pub use gui::{
     run, run_with_controller, run_with_controllers, run_with_controllers_and_settings,
-    run_with_startup_error, MainView,
+    run_with_controllers_and_settings_and_transfers, run_with_startup_error, MainView,
 };
 
 #[cfg(not(feature = "gui"))]
@@ -1866,6 +2375,16 @@ pub fn run_with_controllers_and_settings(
     _controller: std::sync::Arc<dyn SendController>,
     _receive_controller: std::sync::Arc<dyn ReceiveController>,
     _settings_controller: std::sync::Arc<dyn SettingsController>,
+) {
+    eprintln!("drift GUI disabled; rebuild with --features gui");
+}
+
+#[cfg(not(feature = "gui"))]
+pub fn run_with_controllers_and_settings_and_transfers(
+    _controller: std::sync::Arc<dyn SendController>,
+    _receive_controller: std::sync::Arc<dyn ReceiveController>,
+    _settings_controller: std::sync::Arc<dyn SettingsController>,
+    _transfer_controller: std::sync::Arc<dyn TransferController>,
 ) {
     eprintln!("drift GUI disabled; rebuild with --features gui");
 }
