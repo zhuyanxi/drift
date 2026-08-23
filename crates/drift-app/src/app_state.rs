@@ -10,7 +10,7 @@ use drift_core::{
 use drift_protocol::{BackendCapabilities, BackendError, CrocBackend, ReceiveRequest, SendRequest};
 use drift_storage::{
     scan_send_paths, validate_receive_directory, DestinationError, JsonStore, ResumeDiscovery,
-    StorageError,
+    ScanCancellation, SourceScan, SourceScanError, StorageError,
 };
 use drift_transfer::TransferManager;
 use std::{
@@ -153,6 +153,18 @@ pub struct AppHandle {
 }
 
 impl AppHandle {
+    /// Scans sender paths on Drift's Tokio runtime.
+    ///
+    /// UI futures run on GPUI's executor, which does not provide Tokio's filesystem reactor.
+    pub fn scan_send_paths(
+        &self,
+        paths: Vec<PathBuf>,
+        cancellation: ScanCancellation,
+    ) -> JoinHandle<Result<SourceScan, SourceScanError>> {
+        self.runtime
+            .spawn(async move { scan_send_paths(paths, cancellation).await })
+    }
+
     pub fn preflight(&self) -> JoinHandle<Result<(), AppCommandError>> {
         let backend = self.backend.clone();
         self.runtime.spawn(async move {

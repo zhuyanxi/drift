@@ -5,7 +5,7 @@ use drift_core::{
     ResumeRequest, Role, TransferCapability, TransferEvent, TransferId, TransferManifest,
 };
 use drift_protocol::BackendCapability;
-use drift_storage::{scan_send_paths, ScanCancellation, SourceScan, SourceScanError};
+use drift_storage::{ScanCancellation, SourceScan, SourceScanError};
 use drift_ui::{
     failure_label, ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture,
     ReceiveEventStream, ReceiveFuture, RecoveryCandidate, RecoveryKind, RelaySettingsSnapshot,
@@ -56,11 +56,13 @@ impl SendController for AppSendController {
                 previous.cancel();
             }
         }
+        let handle = self.handle.clone();
         Box::pin(async move {
-            scan_send_paths(paths, cancellation)
-                .await
-                .map_err(map_source_scan_error)
-                .and_then(source_scan_to_selection)
+            match handle.scan_send_paths(paths, cancellation).await {
+                Ok(Ok(scan)) => source_scan_to_selection(scan),
+                Ok(Err(error)) => Err(map_source_scan_error(error)),
+                Err(_) => Err(SendCommandError::scan_failed()),
+            }
         })
     }
 
@@ -814,8 +816,59 @@ mod tests {
         FileEntry, TransferFailureKind, TransferManifest, TransferSession, TransferState,
     };
     use drift_ui::{ReceiveEvent, SendEvent, SettingsCommandErrorKind, SettingsController};
-    use std::fs;
+    use std::{
+        fs,
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
+        thread,
+    };
     use uuid::Uuid;
+
+    struct ThreadWaker(thread::Thread);
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn block_on_without_tokio<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
+
+    #[test]
+    fn send_scan_uses_application_runtime_outside_tokio_reactor() {
+        let root = std::env::temp_dir().join(format!("drift-app-ui-scan-{}", Uuid::new_v4()));
+        let config_path = root.join("config").join("config.json");
+        let source_path = root.join("source.txt");
+        crate::settings::SettingsLoader::with_path(&config_path)
+            .save(&crate::settings::DriftSettings::default())
+            .unwrap();
+        fs::write(&source_path, b"scan source").unwrap();
+
+        let state = crate::AppState::bootstrap_with_config_path(&config_path).unwrap();
+        let controller = AppSendController::new(state.handle());
+        let selection = block_on_without_tokio(controller.scan(vec![source_path.clone()]))
+            .expect("scan should use application runtime");
+
+        assert_eq!(selection.item_count(), 1);
+        assert_eq!(selection.total_bytes(), 11);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn controller_error_messages_are_safe_for_ui() {

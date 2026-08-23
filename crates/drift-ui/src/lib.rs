@@ -1077,6 +1077,7 @@ mod gui {
             let Some(generation) = self.send.begin_scan() else {
                 return;
             };
+            cx.notify();
             let controller = Arc::clone(&self.controller);
             self.command_task = Some(cx.spawn(
                 async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
@@ -1226,8 +1227,13 @@ mod gui {
                 })
                 .count();
             let transfer_count = self.transfers.rows().len();
-            let send = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
+            let choose = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
                 view.route = MainRoute::Send;
+                view.dispatch_action(SendAction::Choose, cx);
+            });
+            let drop = cx.listener(|view: &mut MainView, paths: &ExternalPaths, _, cx| {
+                view.route = MainRoute::Send;
+                view.start_scan(paths.paths().to_vec(), cx);
                 cx.notify();
             });
             let receive = cx.listener(|view: &mut MainView, _: &ClickEvent, _, cx| {
@@ -1240,6 +1246,7 @@ mod gui {
             });
             div()
                 .id("home-view")
+                .on_drop(drop)
                 .on_action(cx.listener(|view: &mut MainView, _: &ShowSend, _, cx| {
                     view.route = MainRoute::Send;
                     cx.notify();
@@ -1274,7 +1281,12 @@ mod gui {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(action_button("home-send", "Send files", true, send))
+                        .child(action_button(
+                            "home-choose",
+                            "Choose files or folders",
+                            true,
+                            choose,
+                        ))
                         .child(action_button(
                             "home-receive",
                             "Receive files",
@@ -1651,6 +1663,11 @@ mod gui {
                 .gap_4()
                 .bg(gpui::rgb(0xf7f4ee))
                 .text_color(gpui::rgb(0x1d2a24))
+                .on_drop(
+                    cx.listener(|view: &mut MainView, paths: &ExternalPaths, _, cx| {
+                        view.start_scan(paths.paths().to_vec(), cx);
+                    }),
+                )
                 .on_action(cx.listener(|view: &mut MainView, _: &ShowReceive, _, cx| {
                     view.route = MainRoute::Receive;
                     cx.notify();
@@ -1676,11 +1693,6 @@ mod gui {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .on_drop(cx.listener(
-                            |view: &mut MainView, paths: &ExternalPaths, _, cx| {
-                                view.start_scan(paths.paths().to_vec(), cx);
-                            },
-                        ))
                         .bg(gpui::rgb(0xffffff))
                         .border_1()
                         .border_color(gpui::rgb(0xd7d0c4))
