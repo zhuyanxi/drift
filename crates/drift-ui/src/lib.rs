@@ -1,6 +1,6 @@
-mod send;
-mod receive;
 mod progress;
+mod receive;
+mod send;
 mod settings;
 mod transfer;
 
@@ -20,9 +20,9 @@ pub use settings::{
 };
 pub use transfer::{
     failure_label, RelayStatus, TransferAction, TransferCommandError, TransferCommandErrorKind,
-    TransferCommandFuture, TransferController, TransferDetail, TransferDirection,
-    TransferEventFuture, TransferEventStream, TransferListModel, TransferListState,
-    TransferListFuture, TransferSnapshot, TransferSummary, TransferControls,
+    TransferCommandFuture, TransferController, TransferControls, TransferDetail, TransferDirection,
+    TransferEventFuture, TransferEventStream, TransferListFuture, TransferListModel,
+    TransferListState, TransferSnapshot, TransferSummary,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub struct RecoveryCandidate {
 mod gui {
     use gpui::{
         actions, div, prelude::*, AnyElement, App, Application, AsyncApp, ClickEvent,
-        ClipboardItem, Context, ExternalPaths, FocusHandle, IntoElement, KeyDownEvent, KeyBinding,
+        ClipboardItem, Context, ExternalPaths, FocusHandle, IntoElement, KeyBinding, KeyDownEvent,
         MouseButton, MouseDownEvent, PathPromptOptions, Render, SharedString, Task, WeakEntity,
         Window, WindowOptions,
     };
@@ -50,9 +50,9 @@ mod gui {
 
     use super::{
         ReceiveAction, ReceiveCommandError, ReceiveController, ReceiveEventStream, ReceiveIntent,
-        ReceivePhase, ReceiveViewState, RecoveryCandidate, RecoveryKind, SendAction,
-        SendCommandError, SendController, SendEventStream, SendIntent, SendPhase, SendViewState,
-        RelaySettingsSnapshot, SettingsAction, SettingsCommandError, SettingsCommandErrorKind,
+        ReceivePhase, ReceiveViewState, RecoveryCandidate, RecoveryKind, RelaySettingsSnapshot,
+        SendAction, SendCommandError, SendController, SendEventStream, SendIntent, SendPhase,
+        SendViewState, SettingsAction, SettingsCommandError, SettingsCommandErrorKind,
         SettingsController, SettingsFuture, SettingsIntent, SettingsViewState, TransferAction,
         TransferCommandError, TransferCommandErrorKind, TransferController, TransferEventStream,
         TransferListModel,
@@ -60,7 +60,14 @@ mod gui {
 
     actions!(
         send,
-        [ChooseFiles, StartSend, CopyTransferCode, CancelSend, RecoverSend, DiscardSendRecovery]
+        [
+            ChooseFiles,
+            StartSend,
+            CopyTransferCode,
+            CancelSend,
+            RecoverSend,
+            DiscardSendRecovery
+        ]
     );
     actions!(
         receive,
@@ -209,10 +216,7 @@ mod gui {
     struct UnavailableTransferController;
 
     impl TransferController for UnavailableTransferController {
-        fn cancel(
-            &self,
-            _transfer_id: drift_core::TransferId,
-        ) -> super::TransferCommandFuture {
+        fn cancel(&self, _transfer_id: drift_core::TransferId) -> super::TransferCommandFuture {
             Box::pin(async {
                 Err(TransferCommandError::new(
                     TransferCommandErrorKind::Unavailable,
@@ -220,24 +224,15 @@ mod gui {
             })
         }
 
-        fn retry(
-            &self,
-            transfer_id: drift_core::TransferId,
-        ) -> super::TransferCommandFuture {
+        fn retry(&self, transfer_id: drift_core::TransferId) -> super::TransferCommandFuture {
             self.cancel(transfer_id)
         }
 
-        fn pause(
-            &self,
-            transfer_id: drift_core::TransferId,
-        ) -> super::TransferCommandFuture {
+        fn pause(&self, transfer_id: drift_core::TransferId) -> super::TransferCommandFuture {
             self.cancel(transfer_id)
         }
 
-        fn resume(
-            &self,
-            transfer_id: drift_core::TransferId,
-        ) -> super::TransferCommandFuture {
+        fn resume(&self, transfer_id: drift_core::TransferId) -> super::TransferCommandFuture {
             self.cancel(transfer_id)
         }
 
@@ -409,8 +404,8 @@ mod gui {
                     }
                 });
             let transfer_controller_for_load = Arc::clone(&transfer_controller);
-            let transfer_load_task = cx.spawn(
-                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+            let transfer_load_task =
+                cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
                     let result = transfer_controller_for_load.load().await;
                     let _ = this.update(&mut *cx, |view, cx| {
                         match result {
@@ -424,31 +419,26 @@ mod gui {
                         }
                         cx.notify();
                     });
-                },
-            );
+                });
             let receive = ReceiveViewState::new(receive_controller.default_destination());
             let recovery_controller = Arc::clone(&controller);
-            let recovery_task = cx.spawn(
-                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
-                    let candidates = recovery_controller
-                        .recoveries()
-                        .await
-                        .unwrap_or_default();
+            let recovery_task =
+                cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    let candidates = recovery_controller.recoveries().await.unwrap_or_default();
                     let _ = this.update(&mut *cx, |view, cx| {
                         view.recovery_candidates = candidates;
                         view.transfers.replace_recoveries(&view.recovery_candidates);
                         cx.notify();
                     });
-                },
-            );
+                });
             let initial_validation = receive.destination_validation_intent();
             let initial_command_task = initial_validation.and_then(|intent| {
                 let ReceiveIntent::ValidateDestination { generation, path } = intent else {
                     return None;
                 };
                 let receive_controller = Arc::clone(&receive_controller);
-                Some(cx.spawn(
-                    async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                Some(
+                    cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
                         let result = receive_controller.validate_destination(path).await;
                         let _ = this.update(&mut *cx, |view, cx| {
                             match result {
@@ -459,12 +449,12 @@ mod gui {
                             }
                             cx.notify();
                         });
-                    },
-                ))
+                    }),
+                )
             });
             let settings_controller_for_load = Arc::clone(&settings_controller);
-            let settings_task = cx.spawn(
-                async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+            let settings_task =
+                cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
                     let result = settings_controller_for_load.load().await;
                     let _ = this.update(&mut *cx, |view, cx| {
                         match result {
@@ -473,8 +463,7 @@ mod gui {
                         }
                         cx.notify();
                     });
-                },
-            );
+                });
             let mut transfers = TransferListModel::default();
             transfers.set_loading(true);
             Self {
@@ -728,9 +717,7 @@ mod gui {
                     let _ = this.update(&mut *cx, |view, cx| {
                         match result {
                             Ok(()) => view.receive.mark_destination_valid(generation),
-                            Err(error) => {
-                                view.receive.mark_destination_failed(generation, error)
-                            }
+                            Err(error) => view.receive.mark_destination_failed(generation, error),
                         }
                         cx.notify();
                     });
@@ -792,9 +779,7 @@ mod gui {
                     let _ = this.update(&mut *cx, |view, cx| {
                         match result {
                             Ok(()) => view.receive.mark_destination_valid(generation),
-                            Err(error) => {
-                                view.receive.mark_destination_failed(generation, error)
-                            }
+                            Err(error) => view.receive.mark_destination_failed(generation, error),
                         }
                         cx.notify();
                     });
@@ -970,8 +955,7 @@ mod gui {
                 cx.notify();
                 return;
             }
-            if keystroke.key == "v"
-                && (keystroke.modifiers.platform || keystroke.modifiers.control)
+            if keystroke.key == "v" && (keystroke.modifiers.platform || keystroke.modifiers.control)
             {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     let mut code = self.receive.code().to_owned();
@@ -1011,9 +995,7 @@ mod gui {
             _window: &mut Window,
             cx: &mut Context<Self>,
         ) {
-            if self.route != MainRoute::Settings
-                || event.is_held
-                || !self.settings.input_enabled()
+            if self.route != MainRoute::Settings || event.is_held || !self.settings.input_enabled()
             {
                 return;
             }
@@ -1025,8 +1007,7 @@ mod gui {
                 cx.notify();
                 return;
             }
-            if keystroke.key == "v"
-                && (keystroke.modifiers.platform || keystroke.modifiers.control)
+            if keystroke.key == "v" && (keystroke.modifiers.platform || keystroke.modifiers.control)
             {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     let endpoint = text.replace('\n', "").replace('\r', "");
@@ -1267,10 +1248,12 @@ mod gui {
                     view.route = MainRoute::Receive;
                     cx.notify();
                 }))
-                .on_action(cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
-                    view.route = MainRoute::Transfers;
-                    cx.notify();
-                }))
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
+                        view.route = MainRoute::Transfers;
+                        cx.notify();
+                    }),
+                )
                 .on_action(cx.listener(|view: &mut MainView, _: &ShowSettings, _, cx| {
                     view.route = MainRoute::Settings;
                     cx.notify();
@@ -1292,7 +1275,12 @@ mod gui {
                         .items_center()
                         .gap_2()
                         .child(action_button("home-send", "Send files", true, send))
-                        .child(action_button("home-receive", "Receive files", true, receive))
+                        .child(action_button(
+                            "home-receive",
+                            "Receive files",
+                            true,
+                            receive,
+                        ))
                         .child(action_button(
                             "home-transfers",
                             "View transfers",
@@ -1352,9 +1340,7 @@ mod gui {
                     .child(format!("{} | {}", row.state_label(), progress))
                     .child(row.relay.label());
                 if let Some(error) = row.error {
-                    row_view = row_view
-                        .text_color(gpui::rgb(0x9a3025))
-                        .child(error);
+                    row_view = row_view.text_color(gpui::rgb(0x9a3025)).child(error);
                 }
                 if row.recovery_available {
                     row_view = row_view.child("Recovery available");
@@ -1393,7 +1379,11 @@ mod gui {
                 });
                 detail = detail
                     .child("Selected transfer")
-                    .child(format!("{}: {}", summary.direction.label(), summary.display_name))
+                    .child(format!(
+                        "{}: {}",
+                        summary.direction.label(),
+                        summary.display_name
+                    ))
                     .child(summary.state_label())
                     .child(summary.file_count_label())
                     .child(if summary.progress_supported {
@@ -1438,17 +1428,13 @@ mod gui {
                         reveal,
                     ));
                 if let Some(error) = summary.error {
-                    detail = detail
-                        .text_color(gpui::rgb(0x9a3025))
-                        .child(error);
+                    detail = detail.text_color(gpui::rgb(0x9a3025)).child(error);
                 }
             } else {
                 detail = detail.child("Select a transfer to view details.");
             }
             if let Some(error) = &self.transfer_command_error {
-                detail = detail
-                    .text_color(gpui::rgb(0x9a3025))
-                    .child(error.clone());
+                detail = detail.text_color(gpui::rgb(0x9a3025)).child(error.clone());
             }
 
             let mut root = div()
@@ -1561,10 +1547,20 @@ mod gui {
                 let recover_id = candidate.transfer_id;
                 let discard_id = candidate.transfer_id;
                 let recover = cx.listener(move |view: &mut MainView, _: &ClickEvent, _, cx| {
-                    view.dispatch_action(SendAction::Recover { transfer_id: recover_id }, cx);
+                    view.dispatch_action(
+                        SendAction::Recover {
+                            transfer_id: recover_id,
+                        },
+                        cx,
+                    );
                 });
                 let discard = cx.listener(move |view: &mut MainView, _: &ClickEvent, _, cx| {
-                    view.dispatch_action(SendAction::DiscardRecovery { transfer_id: discard_id }, cx);
+                    view.dispatch_action(
+                        SendAction::DiscardRecovery {
+                            transfer_id: discard_id,
+                        },
+                        cx,
+                    );
                 });
                 recovery_panel = recovery_panel.child(
                     div()
@@ -1631,21 +1627,23 @@ mod gui {
                         );
                     }
                 }))
-                .on_action(cx.listener(|view: &mut MainView, _: &DiscardSendRecovery, _, cx| {
-                    if let Some(candidate) = view
-                        .recovery_candidates
-                        .iter()
-                        .find(|candidate| candidate.kind == RecoveryKind::Send)
-                        .copied()
-                    {
-                        view.dispatch_action(
-                            SendAction::DiscardRecovery {
-                                transfer_id: candidate.transfer_id,
-                            },
-                            cx,
-                        );
-                    }
-                }))
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &DiscardSendRecovery, _, cx| {
+                        if let Some(candidate) = view
+                            .recovery_candidates
+                            .iter()
+                            .find(|candidate| candidate.kind == RecoveryKind::Send)
+                            .copied()
+                        {
+                            view.dispatch_action(
+                                SendAction::DiscardRecovery {
+                                    transfer_id: candidate.transfer_id,
+                                },
+                                cx,
+                            );
+                        }
+                    }),
+                )
                 .size_full()
                 .p_8()
                 .flex()
@@ -1661,10 +1659,12 @@ mod gui {
                     view.route = MainRoute::Settings;
                     cx.notify();
                 }))
-                .on_action(cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
-                    view.route = MainRoute::Transfers;
-                    cx.notify();
-                }))
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
+                        view.route = MainRoute::Transfers;
+                        cx.notify();
+                    }),
+                )
                 .child(div().child("Send"))
                 .child(self.render_navigation(cx))
                 .child(div().child(phase.label()))
@@ -1802,10 +1802,12 @@ mod gui {
                     view.route = MainRoute::Receive;
                     cx.notify();
                 }))
-                .on_action(cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
-                    view.route = MainRoute::Transfers;
-                    cx.notify();
-                }))
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
+                        view.route = MainRoute::Transfers;
+                        cx.notify();
+                    }),
+                )
                 .size_full()
                 .p_8()
                 .flex()
@@ -1866,7 +1868,11 @@ mod gui {
                         )),
                 );
             if let Some(error) = self.settings.error() {
-                root = root.child(div().text_color(gpui::rgb(0x9a3025)).child(error.to_owned()));
+                root = root.child(
+                    div()
+                        .text_color(gpui::rgb(0x9a3025))
+                        .child(error.to_owned()),
+                );
             }
             root.into_any_element()
         }
@@ -1952,52 +1958,62 @@ mod gui {
                     view.route = MainRoute::Send;
                     cx.notify();
                 }))
-                .on_action(cx.listener(|view: &mut MainView, _: &ChooseDestination, _, cx| {
-                    view.dispatch_receive_action(ReceiveAction::ChooseDestination, cx);
-                }))
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &ChooseDestination, _, cx| {
+                        view.dispatch_receive_action(ReceiveAction::ChooseDestination, cx);
+                    }),
+                )
                 .on_action(cx.listener(|view: &mut MainView, _: &CheckCroc, _, cx| {
                     view.dispatch_receive_action(ReceiveAction::Preflight, cx);
                 }))
                 .on_action(cx.listener(|view: &mut MainView, _: &StartReceive, _, cx| {
                     view.dispatch_receive_action(ReceiveAction::Start, cx);
                 }))
-                .on_action(cx.listener(|view: &mut MainView, _: &CancelReceive, _, cx| {
-                    view.dispatch_receive_action(ReceiveAction::Cancel, cx);
-                }))
-                .on_action(cx.listener(|view: &mut MainView, _: &RecoverReceive, _, cx| {
-                    if let Some(candidate) = view
-                        .recovery_candidates
-                        .iter()
-                        .find(|candidate| candidate.kind == RecoveryKind::Receive)
-                        .copied()
-                    {
-                        view.dispatch_receive_action(
-                            ReceiveAction::Recover {
-                                transfer_id: candidate.transfer_id,
-                            },
-                            cx,
-                        );
-                    }
-                }))
-                .on_action(cx.listener(|view: &mut MainView, _: &DiscardReceiveRecovery, _, cx| {
-                    if let Some(candidate) = view
-                        .recovery_candidates
-                        .iter()
-                        .find(|candidate| candidate.kind == RecoveryKind::Receive)
-                        .copied()
-                    {
-                        view.dispatch_receive_action(
-                            ReceiveAction::DiscardRecovery {
-                                transfer_id: candidate.transfer_id,
-                            },
-                            cx,
-                        );
-                    }
-                }))
-                .on_action(cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
-                    view.route = MainRoute::Transfers;
-                    cx.notify();
-                }))
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &CancelReceive, _, cx| {
+                        view.dispatch_receive_action(ReceiveAction::Cancel, cx);
+                    }),
+                )
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &RecoverReceive, _, cx| {
+                        if let Some(candidate) = view
+                            .recovery_candidates
+                            .iter()
+                            .find(|candidate| candidate.kind == RecoveryKind::Receive)
+                            .copied()
+                        {
+                            view.dispatch_receive_action(
+                                ReceiveAction::Recover {
+                                    transfer_id: candidate.transfer_id,
+                                },
+                                cx,
+                            );
+                        }
+                    }),
+                )
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &DiscardReceiveRecovery, _, cx| {
+                        if let Some(candidate) = view
+                            .recovery_candidates
+                            .iter()
+                            .find(|candidate| candidate.kind == RecoveryKind::Receive)
+                            .copied()
+                        {
+                            view.dispatch_receive_action(
+                                ReceiveAction::DiscardRecovery {
+                                    transfer_id: candidate.transfer_id,
+                                },
+                                cx,
+                            );
+                        }
+                    }),
+                )
+                .on_action(
+                    cx.listener(|view: &mut MainView, _: &ShowTransfers, _, cx| {
+                        view.route = MainRoute::Transfers;
+                        cx.notify();
+                    }),
+                )
                 .size_full()
                 .p_8()
                 .flex()
@@ -2098,13 +2114,25 @@ mod gui {
                 root = root.child(div().child("Progress unavailable"));
             }
             if let Some(error) = self.receive.code_error() {
-                root = root.child(div().text_color(gpui::rgb(0x9a3025)).child(error.to_owned()));
+                root = root.child(
+                    div()
+                        .text_color(gpui::rgb(0x9a3025))
+                        .child(error.to_owned()),
+                );
             }
             if let Some(error) = self.receive.destination_error() {
-                root = root.child(div().text_color(gpui::rgb(0x9a3025)).child(error.to_owned()));
+                root = root.child(
+                    div()
+                        .text_color(gpui::rgb(0x9a3025))
+                        .child(error.to_owned()),
+                );
             }
             if let Some(error) = self.receive.error() {
-                root = root.child(div().text_color(gpui::rgb(0x9a3025)).child(error.to_owned()));
+                root = root.child(
+                    div()
+                        .text_color(gpui::rgb(0x9a3025))
+                        .child(error.to_owned()),
+                );
             }
             root.into_any_element()
         }
@@ -2136,12 +2164,7 @@ mod gui {
                 .gap_2()
                 .child(action_button("route-home", "Home", true, home))
                 .child(action_button("route-send", "Send", true, send))
-                .child(action_button(
-                    "route-receive",
-                    "Receive",
-                    true,
-                    receive,
-                ))
+                .child(action_button("route-receive", "Receive", true, receive))
                 .child(action_button(
                     "route-transfers",
                     "Transfers",
@@ -2228,11 +2251,13 @@ mod gui {
             || "speed unavailable".to_owned(),
             |speed_bps| format!("{}/s", format_bytes(speed_bps)),
         );
-        let eta = eta_seconds.map_or_else(
-            || "ETA unavailable".to_owned(),
-            format_eta,
-        );
-        format!("{} / {} | {} | ETA {eta}", format_bytes(transferred), total, speed)
+        let eta = eta_seconds.map_or_else(|| "ETA unavailable".to_owned(), format_eta);
+        format!(
+            "{} / {} | {} | ETA {eta}",
+            format_bytes(transferred),
+            total,
+            speed
+        )
     }
 
     fn format_eta(seconds: u64) -> String {

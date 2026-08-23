@@ -104,9 +104,6 @@ mod tests {
             progress.update(4, 10, 4),
             Err(ProgressError::TransferredDecreased)
         );
-        assert_eq!(
-            progress.update(6, 11, 4),
-            Err(ProgressError::TotalChanged)
-        );
+        assert_eq!(progress.update(6, 11, 4), Err(ProgressError::TotalChanged));
     }
 }

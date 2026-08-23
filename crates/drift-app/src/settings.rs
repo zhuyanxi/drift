@@ -9,24 +9,13 @@ use thiserror::Error;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DriftSettings {
     pub relay: RelaySettings,
     pub transfer: TransferSettings,
     pub ui: UiSettings,
     pub privacy: PrivacySettings,
-}
-
-impl Default for DriftSettings {
-    fn default() -> Self {
-        Self {
-            relay: RelaySettings::default(),
-            transfer: TransferSettings::default(),
-            ui: UiSettings::default(),
-            privacy: PrivacySettings::default(),
-        }
-    }
 }
 
 impl fmt::Debug for DriftSettings {
@@ -59,7 +48,7 @@ impl DriftSettings {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct RelaySettings {
     pub enabled: bool,
@@ -115,15 +104,6 @@ impl fmt::Debug for RelaySettings {
             .field("enabled", &self.enabled)
             .field("url_configured", &self.url.is_some())
             .finish()
-    }
-}
-
-impl Default for RelaySettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            url: None,
-        }
     }
 }
 
@@ -383,11 +363,11 @@ fn set_private_permissions(path: &Path) -> io::Result<()> {
 pub fn default_config_path() -> Result<PathBuf, ConfigPathError> {
     #[cfg(target_os = "macos")]
     {
-        return Ok(home_dir()?
+        Ok(home_dir()?
             .join("Library")
             .join("Application Support")
             .join("Drift")
-            .join("config.json"));
+            .join("config.json"))
     }
 
     #[cfg(target_os = "windows")]
@@ -397,7 +377,7 @@ pub fn default_config_path() -> Result<PathBuf, ConfigPathError> {
             .map(PathBuf::from)
             .or_else(|| home_dir().ok())
             .ok_or(ConfigPathError::ConfigDirectoryUnavailable)?;
-        return Ok(root.join("Drift").join("config.json"));
+        Ok(root.join("Drift").join("config.json"))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -473,7 +453,7 @@ fn is_valid_relay_url(value: &str) -> bool {
         }
         return authority[end + 1..]
             .strip_prefix(':')
-            .map_or(true, valid_port);
+            .is_none_or(valid_port);
     }
 
     let mut parts = authority.split(':');

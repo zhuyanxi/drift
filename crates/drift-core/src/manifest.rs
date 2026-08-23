@@ -268,8 +268,12 @@ impl ChunkScheduler {
             next_index: 0,
         })
     }
+}
 
-    pub fn next(&mut self) -> Option<Chunk> {
+impl Iterator for ChunkScheduler {
+    type Item = Chunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
         while self.next_index < self.chunks.len() {
             let index = self.next_index;
             self.next_index += 1;
@@ -280,7 +284,9 @@ impl ChunkScheduler {
         }
         None
     }
+}
 
+impl ChunkScheduler {
     pub fn mark_completed(&mut self, index: u64) -> bool {
         self.update_state(index, ChunkState::Completed)
     }

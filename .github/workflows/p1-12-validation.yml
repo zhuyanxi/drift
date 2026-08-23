@@ -1,0 +1,133 @@
+name: P1-12 MVP Validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+
+jobs:
+  workspace:
+    name: Workspace checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.0
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy without optional GUI features
+        run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+      - name: Check workspace
+        run: cargo check --workspace --locked
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+      - name: Run P1-12 integration target
+        run: cargo test -p drift-transfer --test p1_12_mvp --locked
+      - name: Write redacted failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p test-output
+          {
+            echo "runner_os=$RUNNER_OS"
+            echo "rustc_version=$(rustc --version)"
+            echo "cargo_version=$(cargo --version)"
+          } > test-output/environment.txt
+      - name: Upload redacted failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p1-12-${{ matrix.os }}-diagnostics
+          path: test-output/environment.txt
+          if-no-files-found: ignore
+
+  gui-smoke:
+    name: GUI smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.0
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev
+      - name: Check macOS Metal Toolchain
+        if: runner.os == 'macOS'
+        id: metal
+        shell: bash
+        run: |
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=GUI smoke blocked::Metal Toolchain is unavailable; install it with xcodebuild -downloadComponent MetalToolchain"
+          fi
+      - name: Run all-features clippy
+        if: runner.os == 'Linux' || steps.metal.outputs.available == 'true'
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Build GUI smoke target
+        if: runner.os == 'Linux' || steps.metal.outputs.available == 'true'
+        run: cargo check -p drift-app --features gui --locked
+      - name: Record macOS GUI blocker
+        if: runner.os == 'macOS' && steps.metal.outputs.available != 'true'
+        run: |
+          echo "GUI smoke blocked: install the Xcode Metal Toolchain with xcodebuild -downloadComponent MetalToolchain." >> "$GITHUB_STEP_SUMMARY"
+
+  dependency-security:
+    name: Dependency security checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.21.2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.18.3
+      - name: Run cargo audit
+        run: cargo audit
+      - name: Run cargo deny
+        run: cargo deny check

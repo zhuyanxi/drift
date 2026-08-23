@@ -9,5 +9,5 @@ mod ui_bridge;
 pub use app_state::{AppCommand, AppCommandError, AppError, AppHandle, AppState};
 pub use event_bridge::{AppTransferUpdate, TransferPresentation};
 pub use ui_bridge::{
-	AppReceiveController, AppSendController, AppSettingsController, AppTransferController,
+    AppReceiveController, AppSendController, AppSettingsController, AppTransferController,
 };

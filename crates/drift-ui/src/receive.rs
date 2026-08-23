@@ -6,8 +6,7 @@ use crate::RecoveryCandidate;
 
 pub type ReceiveFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-pub type ReceiveEventFuture<'a> =
-    Pin<Box<dyn Future<Output = Option<ReceiveEvent>> + Send + 'a>>;
+pub type ReceiveEventFuture<'a> = Pin<Box<dyn Future<Output = Option<ReceiveEvent>> + Send + 'a>>;
 
 pub trait ReceiveEventStream: Send {
     fn next(&mut self) -> ReceiveEventFuture<'_>;
@@ -26,10 +25,8 @@ pub trait ReceiveController: Send + Sync {
         Box::pin(async { Err(ReceiveCommandError::destination_selection_unavailable()) })
     }
 
-    fn validate_destination(
-        &self,
-        path: PathBuf,
-    ) -> ReceiveFuture<Result<(), ReceiveCommandError>>;
+    fn validate_destination(&self, path: PathBuf)
+        -> ReceiveFuture<Result<(), ReceiveCommandError>>;
 
     fn preflight(&self) -> ReceiveFuture<Result<(), ReceiveCommandError>>;
 
@@ -94,9 +91,7 @@ impl ReceiveCommandError {
             ReceiveCommandErrorKind::DestinationSelectionUnavailable => {
                 "Destination selection is unavailable."
             }
-            ReceiveCommandErrorKind::DestinationUnavailable => {
-                "The receive folder is unavailable."
-            }
+            ReceiveCommandErrorKind::DestinationUnavailable => "The receive folder is unavailable.",
             ReceiveCommandErrorKind::DestinationNotWritable => {
                 "The receive folder is not writable."
             }
@@ -537,9 +532,7 @@ impl ReceiveViewState {
         self.inputs_valid()
             && matches!(
                 self.phase,
-                ReceivePhase::AwaitingPreflight
-                    | ReceivePhase::Ready
-                    | ReceivePhase::Failed
+                ReceivePhase::AwaitingPreflight | ReceivePhase::Ready | ReceivePhase::Failed
             )
     }
 
@@ -548,10 +541,12 @@ impl ReceiveViewState {
     }
 
     pub fn destination_validation_intent(&self) -> Option<ReceiveIntent> {
-        self.destination.as_ref().map(|path| ReceiveIntent::ValidateDestination {
-            generation: self.destination_generation,
-            path: path.clone(),
-        })
+        self.destination
+            .as_ref()
+            .map(|path| ReceiveIntent::ValidateDestination {
+                generation: self.destination_generation,
+                path: path.clone(),
+            })
     }
 
     pub fn preflight_enabled(&self) -> bool {
@@ -815,19 +810,15 @@ impl ReceiveViewState {
                 speed_bps,
             } => {
                 if self.accepts_transfer(transfer_id) && self.phase == ReceivePhase::Transferring {
-                    let previous = self.progress.map(|(transferred, total, speed_bps)| {
-                        Progress {
+                    let previous = self
+                        .progress
+                        .map(|(transferred, total, speed_bps)| Progress {
                             transferred_bytes: transferred,
                             total_bytes: total,
                             speed_bps,
-                        }
-                    });
-                    let Some(progress) = accept_progress(
-                        previous,
-                        transferred,
-                        total,
-                        speed_bps,
-                    ) else {
+                        });
+                    let Some(progress) = accept_progress(previous, transferred, total, speed_bps)
+                    else {
                         return;
                     };
                     self.progress = Some((
@@ -1175,7 +1166,8 @@ mod tests {
                 transfer_id,
                 destination,
                 ..
-            }) if transfer_id == old_transfer_id && destination == PathBuf::from("/tmp/receive")
+            }) if transfer_id == old_transfer_id
+                && destination.as_path() == std::path::Path::new("/tmp/receive")
         ));
         assert!(!state.discard_recovery_enabled());
         assert_eq!(

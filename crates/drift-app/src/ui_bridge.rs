@@ -9,12 +9,11 @@ use drift_storage::{scan_send_paths, ScanCancellation, SourceScan, SourceScanErr
 use drift_ui::{
     failure_label, ReceiveCommandError, ReceiveController, ReceiveEvent, ReceiveEventFuture,
     ReceiveEventStream, ReceiveFuture, RecoveryCandidate, RecoveryKind, RelaySettingsSnapshot,
-    SelectedItem, SendCommandError, SendCommandErrorKind, SendController, SendEvent,
+    RelayStatus, SelectedItem, SendCommandError, SendCommandErrorKind, SendController, SendEvent,
     SendEventFuture, SendEventStream, SendFuture, SendProgress, SendSelection,
     SettingsCommandError, SettingsCommandErrorKind, SettingsController, SettingsFuture,
-    RelayStatus, TransferCommandError, TransferCommandErrorKind, TransferCommandFuture,
-    TransferController, TransferEventFuture, TransferEventStream, TransferListFuture,
-    TransferSnapshot,
+    TransferCommandError, TransferCommandErrorKind, TransferCommandFuture, TransferController,
+    TransferEventFuture, TransferEventStream, TransferListFuture, TransferSnapshot,
 };
 use std::{
     future::Future,
@@ -222,17 +221,19 @@ impl TransferController for AppTransferController {
             let sessions = handle.sessions().await;
             let mut snapshots = Vec::with_capacity(sessions.len());
             for session in sessions {
-                let presentation = handle.presentation(session.id).await.unwrap_or_else(|| {
-                    TransferPresentation {
-                        transfer_id: session.id,
-                        role: session.role,
-                        state: session.state,
-                        progress: session.progress,
-                        code_available: session.code.is_some(),
-                        error: session.error.clone(),
-                        failure_kind: session.failure_kind,
-                    }
-                });
+                let presentation =
+                    handle
+                        .presentation(session.id)
+                        .await
+                        .unwrap_or_else(|| TransferPresentation {
+                            transfer_id: session.id,
+                            role: session.role,
+                            state: session.state,
+                            progress: session.progress,
+                            code_available: session.code.is_some(),
+                            error: session.error.clone(),
+                            failure_kind: session.failure_kind,
+                        });
                 snapshots.push(transfer_snapshot(&handle, presentation, Some(session)).await);
             }
             Ok(snapshots)
@@ -260,9 +261,9 @@ impl TransferController for AppTransferController {
         Box::pin(async move {
             match handle.reveal_destination(transfer_id).await {
                 Ok(Ok(transfer_id)) => Ok(transfer_id),
-                Ok(Err(AppCommandError::DestinationUnavailable)) => Err(
-                    TransferCommandError::new(TransferCommandErrorKind::DestinationUnavailable),
-                ),
+                Ok(Err(AppCommandError::DestinationUnavailable)) => Err(TransferCommandError::new(
+                    TransferCommandErrorKind::DestinationUnavailable,
+                )),
                 Ok(Err(_)) => Err(TransferCommandError::new(TransferCommandErrorKind::Failed)),
                 Err(_) => Err(TransferCommandError::new(
                     TransferCommandErrorKind::Unavailable,
@@ -337,7 +338,9 @@ async fn transfer_snapshot(
         Some(session) => Some(session),
         None => handle.session(presentation.transfer_id).await,
     };
-    let manifest = session.as_ref().and_then(|session| session.manifest.as_ref());
+    let manifest = session
+        .as_ref()
+        .and_then(|session| session.manifest.as_ref());
     let display_name = manifest
         .and_then(|manifest| manifest.files.first())
         .and_then(|file| file.relative_path.file_name())
@@ -372,9 +375,7 @@ async fn transfer_snapshot(
         error,
         destination_available: presentation.state == drift_core::TransferState::Completed
             && presentation.role == drift_core::Role::Receiver
-            && handle
-                .destination_available(presentation.transfer_id)
-                .await,
+            && handle.destination_available(presentation.transfer_id).await,
     }
 }
 
@@ -681,133 +682,126 @@ impl ReceiveEventStream for AppReceiveEventStream {
     }
 }
 
-fn map_notification(
-    handle: &AppHandle,
-    update: AppTransferUpdate,
-) -> impl Future<Output = Option<SendEvent>> + Send + '_ {
-    async move {
-        let AppTransferUpdate {
+async fn map_notification(handle: &AppHandle, update: AppTransferUpdate) -> Option<SendEvent> {
+    let AppTransferUpdate {
+        transfer_id,
+        event,
+        presentation,
+    } = update;
+    if presentation.role != Role::Sender {
+        return None;
+    }
+    let retryable = presentation.retryable();
+    Some(match event {
+        TransferEvent::Created => SendEvent::Created { transfer_id },
+        TransferEvent::Connecting => SendEvent::Connecting { transfer_id },
+        TransferEvent::Connected => SendEvent::Connected { transfer_id },
+        TransferEvent::Authenticating => SendEvent::Authenticating { transfer_id },
+        TransferEvent::Negotiating => SendEvent::Negotiating { transfer_id },
+        TransferEvent::Started => SendEvent::Started { transfer_id },
+        TransferEvent::CodeAvailable => SendEvent::CodeAvailable {
             transfer_id,
-            event,
-            presentation,
-        } = update;
-        if presentation.role != Role::Sender {
-            return None;
-        }
-        let retryable = presentation.retryable();
-        Some(match event {
-            TransferEvent::Created => SendEvent::Created { transfer_id },
-            TransferEvent::Connecting => SendEvent::Connecting { transfer_id },
-            TransferEvent::Connected => SendEvent::Connected { transfer_id },
-            TransferEvent::Authenticating => SendEvent::Authenticating { transfer_id },
-            TransferEvent::Negotiating => SendEvent::Negotiating { transfer_id },
-            TransferEvent::Started => SendEvent::Started { transfer_id },
-            TransferEvent::CodeAvailable => SendEvent::CodeAvailable {
-                transfer_id,
-                code: handle.session(transfer_id).await?.code?,
-            },
-            TransferEvent::Progress {
+            code: handle.session(transfer_id).await?.code?,
+        },
+        TransferEvent::Progress {
+            transferred,
+            total,
+            speed_bps,
+        } => SendEvent::Progress {
+            transfer_id,
+            progress: SendProgress {
                 transferred,
                 total,
                 speed_bps,
-            } => SendEvent::Progress {
-                transfer_id,
-                progress: SendProgress {
-                    transferred,
-                    total,
-                    speed_bps,
-                },
             },
-            TransferEvent::CapabilityUnavailable {
-                capability: TransferCapability::Progress,
-            } => SendEvent::CapabilityUnavailable {
-                transfer_id,
-                capability: TransferCapability::Progress,
-            },
-            TransferEvent::CapabilityUnavailable {
-                capability: TransferCapability::Pause | TransferCapability::Resume,
-            } => return None,
-            TransferEvent::Verifying => SendEvent::Verifying { transfer_id },
-            TransferEvent::Completed => SendEvent::Completed { transfer_id },
-            TransferEvent::Failed => SendEvent::Failed {
-                transfer_id,
-                message: safe_failure_message(
-                    presentation.state,
-                    presentation.failure_kind,
-                    retryable,
-                    "The transfer failed.",
-                )
-                .unwrap_or_else(|| "The transfer failed.".to_owned()),
+        },
+        TransferEvent::CapabilityUnavailable {
+            capability: TransferCapability::Progress,
+        } => SendEvent::CapabilityUnavailable {
+            transfer_id,
+            capability: TransferCapability::Progress,
+        },
+        TransferEvent::CapabilityUnavailable {
+            capability: TransferCapability::Pause | TransferCapability::Resume,
+        } => return None,
+        TransferEvent::Verifying => SendEvent::Verifying { transfer_id },
+        TransferEvent::Completed => SendEvent::Completed { transfer_id },
+        TransferEvent::Failed => SendEvent::Failed {
+            transfer_id,
+            message: safe_failure_message(
+                presentation.state,
+                presentation.failure_kind,
                 retryable,
-            },
-            TransferEvent::Cancelled => SendEvent::Cancelled { transfer_id },
-            TransferEvent::MetadataReady | TransferEvent::Paused | TransferEvent::Resumed => {
-                return None
-            }
-        })
-    }
+                "The transfer failed.",
+            )
+            .unwrap_or_else(|| "The transfer failed.".to_owned()),
+            retryable,
+        },
+        TransferEvent::Cancelled => SendEvent::Cancelled { transfer_id },
+        TransferEvent::MetadataReady | TransferEvent::Paused | TransferEvent::Resumed => {
+            return None
+        }
+    })
 }
 
-fn map_receive_notification(
+async fn map_receive_notification(
     _handle: &AppHandle,
     update: AppTransferUpdate,
-) -> impl Future<Output = Option<ReceiveEvent>> + Send + '_ {
-    async move {
-        let AppTransferUpdate {
-            transfer_id,
-            event,
-            presentation,
-        } = update;
-        if presentation.role != Role::Receiver {
-            return None;
-        }
-        let retryable = presentation.retryable();
-        Some(match event {
-            TransferEvent::Created => ReceiveEvent::Created { transfer_id },
-            TransferEvent::Connecting => ReceiveEvent::Connecting { transfer_id },
-            TransferEvent::Connected => ReceiveEvent::Connected { transfer_id },
-            TransferEvent::Authenticating => ReceiveEvent::Authenticating { transfer_id },
-            TransferEvent::Negotiating => ReceiveEvent::Negotiating { transfer_id },
-            TransferEvent::Started => ReceiveEvent::Started { transfer_id },
-            TransferEvent::Progress {
-                transferred,
-                total,
-                speed_bps,
-            } => ReceiveEvent::Progress {
-                transfer_id,
-                transferred,
-                total,
-                speed_bps,
-            },
-            TransferEvent::CapabilityUnavailable {
-                capability: TransferCapability::Progress,
-            } => ReceiveEvent::CapabilityUnavailable {
-                transfer_id,
-                capability: TransferCapability::Progress,
-            },
-            TransferEvent::CapabilityUnavailable {
-                capability: TransferCapability::Pause | TransferCapability::Resume,
-            } => return None,
-            TransferEvent::Verifying => ReceiveEvent::Verifying { transfer_id },
-            TransferEvent::Completed => ReceiveEvent::Completed { transfer_id },
-            TransferEvent::Failed => ReceiveEvent::Failed {
-                transfer_id,
-                message: safe_failure_message(
-                    presentation.state,
-                    presentation.failure_kind,
-                    retryable,
-                    "The receive transfer failed.",
-                )
-                .unwrap_or_else(|| "The receive transfer failed.".to_owned()),
-                retryable,
-            },
-            TransferEvent::Cancelled => ReceiveEvent::Cancelled { transfer_id },
-            TransferEvent::CodeAvailable
-            | TransferEvent::MetadataReady
-            | TransferEvent::Paused
-            | TransferEvent::Resumed => return None,
-        })
+) -> Option<ReceiveEvent> {
+    let AppTransferUpdate {
+        transfer_id,
+        event,
+        presentation,
+    } = update;
+    if presentation.role != Role::Receiver {
+        return None;
     }
+    let retryable = presentation.retryable();
+    Some(match event {
+        TransferEvent::Created => ReceiveEvent::Created { transfer_id },
+        TransferEvent::Connecting => ReceiveEvent::Connecting { transfer_id },
+        TransferEvent::Connected => ReceiveEvent::Connected { transfer_id },
+        TransferEvent::Authenticating => ReceiveEvent::Authenticating { transfer_id },
+        TransferEvent::Negotiating => ReceiveEvent::Negotiating { transfer_id },
+        TransferEvent::Started => ReceiveEvent::Started { transfer_id },
+        TransferEvent::Progress {
+            transferred,
+            total,
+            speed_bps,
+        } => ReceiveEvent::Progress {
+            transfer_id,
+            transferred,
+            total,
+            speed_bps,
+        },
+        TransferEvent::CapabilityUnavailable {
+            capability: TransferCapability::Progress,
+        } => ReceiveEvent::CapabilityUnavailable {
+            transfer_id,
+            capability: TransferCapability::Progress,
+        },
+        TransferEvent::CapabilityUnavailable {
+            capability: TransferCapability::Pause | TransferCapability::Resume,
+        } => return None,
+        TransferEvent::Verifying => ReceiveEvent::Verifying { transfer_id },
+        TransferEvent::Completed => ReceiveEvent::Completed { transfer_id },
+        TransferEvent::Failed => ReceiveEvent::Failed {
+            transfer_id,
+            message: safe_failure_message(
+                presentation.state,
+                presentation.failure_kind,
+                retryable,
+                "The receive transfer failed.",
+            )
+            .unwrap_or_else(|| "The receive transfer failed.".to_owned()),
+            retryable,
+        },
+        TransferEvent::Cancelled => ReceiveEvent::Cancelled { transfer_id },
+        TransferEvent::CodeAvailable
+        | TransferEvent::MetadataReady
+        | TransferEvent::Paused
+        | TransferEvent::Resumed => return None,
+    })
 }
 
 #[allow(dead_code)]
@@ -816,7 +810,9 @@ type _SendEventFutureCheck<'a> = Pin<Box<dyn Future<Output = Option<SendEvent>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drift_core::{FileEntry, TransferFailureKind, TransferManifest, TransferSession, TransferState};
+    use drift_core::{
+        FileEntry, TransferFailureKind, TransferManifest, TransferSession, TransferState,
+    };
     use drift_ui::{ReceiveEvent, SendEvent, SettingsCommandErrorKind, SettingsController};
     use std::fs;
     use uuid::Uuid;

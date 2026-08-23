@@ -39,7 +39,10 @@ pub trait SendController: Send + Sync {
 
     fn retry(&self, transfer_id: TransferId) -> SendFuture<Result<TransferId, SendCommandError>>;
 
-    fn recover(&self, _transfer_id: TransferId) -> SendFuture<Result<TransferId, SendCommandError>> {
+    fn recover(
+        &self,
+        _transfer_id: TransferId,
+    ) -> SendFuture<Result<TransferId, SendCommandError>> {
         Box::pin(async { Err(SendCommandError::start_failed()) })
     }
 
@@ -689,7 +692,10 @@ impl SendViewState {
 
     pub fn recovery_enabled(&self) -> bool {
         self.active_transfer_id.is_none()
-            && matches!(self.phase, SendPhase::Empty | SendPhase::Ready | SendPhase::Failed)
+            && matches!(
+                self.phase,
+                SendPhase::Empty | SendPhase::Ready | SendPhase::Failed
+            )
     }
 
     pub fn start_enabled(&self) -> bool {
@@ -833,9 +839,7 @@ impl SendViewState {
                     SendPhase::Preflighting | SendPhase::Ready | SendPhase::Failed
                 ) =>
             {
-                let Some(selection) = self.selection.as_mut() else {
-                    return None;
-                };
+                let selection = self.selection.as_mut()?;
                 if !selection.remove(index) {
                     return None;
                 }
@@ -1036,12 +1040,10 @@ impl SendViewState {
                 if self.accepts_transfer(transfer_id)
                     && matches!(self.phase, SendPhase::Transferring | SendPhase::CodeReady)
                 {
-                    let previous = self.progress.map(|current| {
-                        Progress {
-                            transferred_bytes: current.transferred,
-                            total_bytes: current.total,
-                            speed_bps: current.speed_bps,
-                        }
+                    let previous = self.progress.map(|current| Progress {
+                        transferred_bytes: current.transferred,
+                        total_bytes: current.total,
+                        speed_bps: current.speed_bps,
                     });
                     let Some(progress) = accept_progress(
                         previous,
@@ -1240,8 +1242,8 @@ mod tests {
     #[test]
     fn unscanned_selection_cannot_start_transfer() {
         let mut state = SendViewState::new();
-        let selection = SendSelection::new(vec![SelectedItem::new("file.txt", 4).unwrap()])
-            .unwrap();
+        let selection =
+            SendSelection::new(vec![SelectedItem::new("file.txt", 4).unwrap()]).unwrap();
         let generation = match state.set_selection(selection) {
             SendIntent::Preflight { generation, .. } => generation,
             other => panic!("unexpected intent: {other:?}"),
@@ -1276,21 +1278,17 @@ mod tests {
 
         assert_eq!(state.phase(), SendPhase::Transferring);
         assert_eq!(state.transfer_code(), Some("secret-code"));
-        assert_eq!(
-            format!("{state:?}").contains("secret-code"),
-            false,
+        assert!(
+            !format!("{state:?}").contains("secret-code"),
             "state debug must not expose transfer code"
         );
-        assert_eq!(
-            format!(
-                "{:?}",
-                SendIntent::CopyCode {
-                    code: "secret-code".into()
-                }
-            )
-            .contains("secret-code"),
-            false
-        );
+        assert!(!format!(
+            "{:?}",
+            SendIntent::CopyCode {
+                code: "secret-code".into()
+            }
+        )
+        .contains("secret-code"));
 
         state.apply_event(SendEvent::Completed { transfer_id });
         assert_eq!(state.phase(), SendPhase::Completed);
@@ -1330,7 +1328,10 @@ mod tests {
                 speed_bps: 10,
             },
         });
-        assert_eq!(state.progress().map(|progress| progress.transferred), Some(25));
+        assert_eq!(
+            state.progress().map(|progress| progress.transferred),
+            Some(25)
+        );
 
         state.apply_event(SendEvent::Verifying { transfer_id });
         assert_eq!(state.progress_eta_seconds(), None);
@@ -1344,7 +1345,10 @@ mod tests {
             },
         });
         assert_eq!(state.phase(), SendPhase::Verifying);
-        assert_eq!(state.progress().map(|progress| progress.transferred), Some(25));
+        assert_eq!(
+            state.progress().map(|progress| progress.transferred),
+            Some(25)
+        );
     }
 
     #[test]

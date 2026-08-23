@@ -297,9 +297,7 @@ where
                     .map_err(|_| TransferError::Backend("invalid resume request".into()))?;
                 self.start_send_with_manifest(request, state.manifest).await
             }
-            ResumeRequest::Receive {
-                output_directory,
-            } => {
+            ResumeRequest::Receive { output_directory } => {
                 let code = receive_code.ok_or(TransferError::Backend(
                     "receive recovery requires transfer code".into(),
                 ))?;
@@ -352,7 +350,10 @@ where
         let session = sessions
             .get_mut(&transfer_id)
             .ok_or_else(|| TransferError::Backend("transfer session not found".into()))?;
-        if !matches!(session.state, TransferState::Transferring | TransferState::Resuming) {
+        if !matches!(
+            session.state,
+            TransferState::Transferring | TransferState::Resuming
+        ) {
             return Err(TransferError::ProgressNotAllowed(session.state));
         }
         session.update_progress_with_total(transferred, total, speed_bps)?;
@@ -1211,7 +1212,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            manager.session(transfer_id).await.unwrap().progress.transferred_bytes,
+            manager
+                .session(transfer_id)
+                .await
+                .unwrap()
+                .progress
+                .transferred_bytes,
             4
         );
         assert_eq!(
@@ -1246,7 +1252,12 @@ mod tests {
             Err(TransferError::ProgressNotAllowed(TransferState::Completed))
         );
         assert_eq!(
-            manager.session(transfer_id).await.unwrap().progress.transferred_bytes,
+            manager
+                .session(transfer_id)
+                .await
+                .unwrap()
+                .progress
+                .transferred_bytes,
             4
         );
     }
@@ -1621,13 +1632,11 @@ mod tests {
             .await
             .unwrap();
         loop {
-            let notification = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                events.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             if notification.transfer_id == new_transfer_id
                 && matches!(
                     notification.event,
@@ -1680,13 +1689,11 @@ exit 0"#,
             .unwrap();
 
         loop {
-            let notification = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                events.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             if notification.transfer_id == transfer_id
                 && notification.event == TransferEvent::Completed
             {
@@ -1698,13 +1705,11 @@ exit 0"#,
             std::fs::read(root.join("file.txt")).unwrap(),
             b"received output"
         );
-        assert!(!std::fs::read_dir(&root)
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
             .unwrap()
-            .any(|entry| entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".drift-staging-")));
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".drift-staging-")));
         assert_eq!(
             manager.session(transfer_id).await.unwrap().state,
             TransferState::Completed
@@ -1744,13 +1749,11 @@ exit 7"#,
             .unwrap();
 
         loop {
-            let notification = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                events.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             if notification.transfer_id == transfer_id
                 && notification.event == TransferEvent::Failed
             {
@@ -1762,13 +1765,11 @@ exit 7"#,
         }
 
         assert!(!root.join("file.txt").exists());
-        assert!(!std::fs::read_dir(&root)
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
             .unwrap()
-            .any(|entry| entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".drift-staging-")));
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".drift-staging-")));
         assert_eq!(
             manager.session(transfer_id).await.unwrap().failure_kind,
             Some(TransferFailureKind::ProcessFailure)
@@ -1809,13 +1810,11 @@ mkdir -p "$output"
             .unwrap();
 
         loop {
-            let notification = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                events.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             if notification.transfer_id == transfer_id
                 && notification.event == TransferEvent::Failed
             {
@@ -1846,10 +1845,8 @@ mkdir -p "$output"
     #[tokio::test]
     async fn persists_secret_free_recovery_and_restarts_only_after_explicit_action() {
         let script = versioned_script("sleep 1");
-        let root = std::env::temp_dir().join(format!(
-            "drift-transfer-recovery-{}",
-            TransferId::new()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("drift-transfer-recovery-{}", TransferId::new()));
         let store = JsonStore::new(&root);
         let manager = TransferManager::with_resume_store(
             CrocBackend::new(&script).with_timeout(std::time::Duration::from_millis(50)),
@@ -1938,10 +1935,8 @@ mkdir -p "$output"
     #[tokio::test]
     async fn terminal_process_failure_removes_recovery_metadata() {
         let script = versioned_script("exit 7");
-        let root = std::env::temp_dir().join(format!(
-            "drift-transfer-terminal-{}",
-            TransferId::new()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("drift-transfer-terminal-{}", TransferId::new()));
         let store = JsonStore::new(&root);
         let manager =
             TransferManager::with_resume_store(CrocBackend::new(&script), "croc", store.clone());

@@ -1,6 +1,6 @@
 use drift_app::{
-    logging, AppReceiveController, AppSendController, AppSettingsController,
-    AppTransferController, AppState,
+    logging, AppReceiveController, AppSendController, AppSettingsController, AppState,
+    AppTransferController,
 };
 
 fn main() {

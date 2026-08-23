@@ -239,10 +239,7 @@ impl AppHandle {
         })
     }
 
-    pub fn validate_destination(
-        &self,
-        path: PathBuf,
-    ) -> JoinHandle<Result<(), AppCommandError>> {
+    pub fn validate_destination(&self, path: PathBuf) -> JoinHandle<Result<(), AppCommandError>> {
         self.runtime.spawn(async move {
             validate_receive_directory(path)
                 .await
@@ -759,10 +756,12 @@ mod tests {
 
     #[test]
     fn disabled_relay_settings_leave_default_request_routing_untouched() {
-        let mut settings = DriftSettings::default();
-        settings.relay = RelaySettings {
-            enabled: false,
-            url: Some("https://configured-but-disabled.example.test".into()),
+        let settings = DriftSettings {
+            relay: RelaySettings {
+                enabled: false,
+                url: Some("https://configured-but-disabled.example.test".into()),
+            },
+            ..DriftSettings::default()
         };
         let request = apply_relay(
             SendRequest::new(vec![PathBuf::from("source.txt")]).unwrap(),
@@ -775,10 +774,12 @@ mod tests {
     fn dispatch_reports_invalid_settings_as_load_failure() {
         let root = temp_path();
         fs::create_dir_all(&root).unwrap();
-        let mut settings = DriftSettings::default();
-        settings.relay = RelaySettings {
-            enabled: true,
-            url: Some("ftp://relay.example.test".into()),
+        let settings = DriftSettings {
+            relay: RelaySettings {
+                enabled: true,
+                url: Some("ftp://relay.example.test".into()),
+            },
+            ..DriftSettings::default()
         };
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
 
@@ -954,7 +955,10 @@ mod tests {
             Err(AppCommandError::Transfer(TransferError::Backend(message)))
                 if message == "resume backend is incompatible"
         ));
-        assert_eq!(runtime.block_on(store.load_resume(transfer_id)).unwrap(), Some(state));
+        assert_eq!(
+            runtime.block_on(store.load_resume(transfer_id)).unwrap(),
+            Some(state)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -971,11 +975,13 @@ mod tests {
             .unwrap();
         let state = AppState::bootstrap_with_config_path(&config_path).unwrap();
 
-        let result = state.runtime.block_on(state.handle().dispatch(AppCommand::Receive {
-            code: "transfer-code".into(),
-            output_directory: Some(root.join("missing").join("nested")),
-        }))
-        .unwrap();
+        let result = state
+            .runtime
+            .block_on(state.handle().dispatch(AppCommand::Receive {
+                code: "transfer-code".into(),
+                output_directory: Some(root.join("missing").join("nested")),
+            }))
+            .unwrap();
 
         assert!(matches!(
             result,

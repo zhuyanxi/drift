@@ -442,10 +442,7 @@ impl ReceiveStaging {
         let existing_destination_entries = read_directory_names(&destination)
             .await
             .map_err(ReceiveStagingError::Io)?;
-        let relative_path = PathBuf::from(format!(
-            "{RECEIVE_STAGING_PREFIX}{}",
-            TransferId::new()
-        ));
+        let relative_path = PathBuf::from(format!("{RECEIVE_STAGING_PREFIX}{}", TransferId::new()));
         let path = destination.join(&relative_path);
         fs::create_dir(&path)
             .await
@@ -593,7 +590,10 @@ pub async fn validate_receive_directory(path: impl AsRef<Path>) -> Result<(), De
             if matches!(
                 error.kind(),
                 io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
-            ) => Err(DestinationError::NotWritable),
+            ) =>
+        {
+            Err(DestinationError::NotWritable)
+        }
         Err(_) => Err(DestinationError::Unavailable),
     }
 }
@@ -705,7 +705,10 @@ async fn reject_unexpected_destination_entries(
     Ok(())
 }
 
-async fn validate_staged_tree(path: &Path, relative_path: &Path) -> Result<(), ReceiveStagingError> {
+async fn validate_staged_tree(
+    path: &Path,
+    relative_path: &Path,
+) -> Result<(), ReceiveStagingError> {
     let mut pending = vec![(path.to_path_buf(), relative_path.to_path_buf())];
     while let Some((path, relative_path)) = pending.pop() {
         sanitize_relative_path(&relative_path)
@@ -730,9 +733,7 @@ async fn validate_staged_tree(path: &Path, relative_path: &Path) -> Result<(), R
     Ok(())
 }
 
-async fn rollback_published(
-    published: &[(PathBuf, PathBuf)],
-) -> Result<(), ReceiveStagingError> {
+async fn rollback_published(published: &[(PathBuf, PathBuf)]) -> Result<(), ReceiveStagingError> {
     for (published_path, staged_path) in published.iter().rev() {
         if let Err(error) =
             rename_without_replacing(published_path.clone(), staged_path.clone()).await
@@ -754,9 +755,8 @@ fn rename_without_replacing_sync(source: &Path, destination: &Path) -> io::Resul
     {
         let source = path_to_c_string(source)?;
         let destination = path_to_c_string(destination)?;
-        let result = unsafe {
-            libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL)
-        };
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
         if result == 0 {
             Ok(())
         } else {
@@ -803,10 +803,7 @@ fn path_to_c_string(path: &Path) -> io::Result<std::ffi::CString> {
 }
 
 fn is_receive_staging_path(path: &Path) -> bool {
-    path.components().count() == 1
-        && path
-            .file_name()
-            .is_some_and(is_receive_staging_name)
+    path.components().count() == 1 && path.file_name().is_some_and(is_receive_staging_name)
 }
 
 fn is_receive_staging_name(name: &OsStr) -> bool {
@@ -963,7 +960,10 @@ impl JsonStore {
                         if is_receive_staging_path(&temp_file_path)
                             && validate_destination_components(output_directory)
                                 .await
-                                .is_ok() => output_directory.join(&temp_file_path),
+                                .is_ok() =>
+                    {
+                        output_directory.join(&temp_file_path)
+                    }
                     _ => self.root.join(&temp_file_path),
                 };
                 remove_owned_partial(partial_path).await?;
@@ -1028,10 +1028,8 @@ mod tests {
 
     #[tokio::test]
     async fn discovers_valid_resume_and_counts_corrupt_metadata() {
-        let root = std::env::temp_dir().join(format!(
-            "drift-storage-discovery-{}",
-            TransferId::new()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("drift-storage-discovery-{}", TransferId::new()));
         let store = JsonStore::new(&root);
         let transfer_id = TransferId::new();
         let file = FileEntry::new("source.bin", 10).unwrap();
@@ -1072,10 +1070,8 @@ mod tests {
 
     #[tokio::test]
     async fn discarding_resume_removes_explicitly_owned_partial_file_and_metadata() {
-        let root = std::env::temp_dir().join(format!(
-            "drift-storage-discard-{}",
-            TransferId::new()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("drift-storage-discard-{}", TransferId::new()));
         let store = JsonStore::new(&root);
         let state = ResumeState {
             schema_version: drift_core::RESUME_SCHEMA_VERSION,
@@ -1139,7 +1135,9 @@ mod tests {
         let partial_path = partial_directory.join(format!("{}.partial", state.transfer_id));
         store.save_resume(&state).await.unwrap();
         fs::create_dir_all(&partial_directory).await.unwrap();
-        fs::write(&partial_path, b"croc-owned output").await.unwrap();
+        fs::write(&partial_path, b"croc-owned output")
+            .await
+            .unwrap();
 
         store.discard_resume(state.transfer_id).await.unwrap();
 
@@ -1150,7 +1148,8 @@ mod tests {
 
     #[tokio::test]
     async fn validates_writable_receive_directory() {
-        let root = std::env::temp_dir().join(format!("drift-storage-destination-{}", TransferId::new()));
+        let root =
+            std::env::temp_dir().join(format!("drift-storage-destination-{}", TransferId::new()));
         fs::create_dir_all(&root).await.unwrap();
 
         assert_eq!(validate_receive_directory(&root).await, Ok(()));
@@ -1160,7 +1159,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_empty_file_and_unavailable_receive_destinations() {
-        let root = std::env::temp_dir().join(format!("drift-storage-destination-{}", TransferId::new()));
+        let root =
+            std::env::temp_dir().join(format!("drift-storage-destination-{}", TransferId::new()));
         fs::create_dir_all(&root).await.unwrap();
         let file = root.join("file");
         fs::write(&file, b"not a directory").await.unwrap();
@@ -1219,7 +1219,10 @@ mod tests {
 
         first.finalize().await.unwrap();
 
-        assert_eq!(fs::read(destination.join("first.txt")).await.unwrap(), b"first");
+        assert_eq!(
+            fs::read(destination.join("first.txt")).await.unwrap(),
+            b"first"
+        );
         second.cleanup().await.unwrap();
         let _ = fs::remove_dir_all(root).await;
     }
@@ -1239,8 +1242,14 @@ mod tests {
 
         staging.finalize().await.unwrap();
 
-        assert_eq!(fs::read(destination.join("first.txt")).await.unwrap(), b"first");
-        assert_eq!(fs::read(destination.join("second.txt")).await.unwrap(), b"second");
+        assert_eq!(
+            fs::read(destination.join("first.txt")).await.unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            fs::read(destination.join("second.txt")).await.unwrap(),
+            b"second"
+        );
         let _ = fs::remove_dir_all(root).await;
     }
 
