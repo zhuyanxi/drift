@@ -38,8 +38,6 @@ jobs:
         run: cargo check --workspace --locked
       - name: Run workspace tests
         run: cargo test --workspace --locked
-      - name: Run P1-12 integration target
-        run: cargo test -p drift-transfer --test p1_12_mvp --locked
       - name: Write redacted failure diagnostics
         if: failure()
         shell: bash

@@ -784,13 +784,16 @@ fn rename_without_replacing_sync(source: &Path, destination: &Path) -> io::Resul
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        let _ = (source, destination);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "exclusive rename unsupported on this platform",
-        ))
+        let source = path_to_wide_string(source)?;
+        let destination = path_to_wide_string(destination)?;
+        let result = unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), 0) };
+        if result != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }
 
@@ -800,6 +803,29 @@ fn path_to_c_string(path: &Path) -> io::Result<std::ffi::CString> {
 
     std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
+}
+
+#[cfg(target_os = "windows")]
+fn path_to_wide_string(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains NUL character",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "MoveFileExW"]
+    fn move_file_ex_w(existing_file_name: *const u16, new_file_name: *const u16, flags: u32)
+        -> i32;
 }
 
 fn is_receive_staging_path(path: &Path) -> bool {
