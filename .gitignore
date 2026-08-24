@@ -2,11 +2,6 @@ target/
 .DS_Store
 
 docs/*
-!docs/03-p1-08-croc-compatibility.md
-!docs/04-p1-12-mvp-validation.md
-!docs/jira/
-docs/jira/*
-!docs/jira/P1-12-mvp-integration-and-platform-validation.md
 
 # ============================================================
 # Drift
