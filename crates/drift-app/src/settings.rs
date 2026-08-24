@@ -110,6 +110,7 @@ impl fmt::Debug for RelaySettings {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferSettings {
+    pub backend: BackendKind,
     pub croc_executable: PathBuf,
     pub default_receive_directory: PathBuf,
     #[serde(with = "duration_seconds")]
@@ -119,6 +120,7 @@ pub struct TransferSettings {
 impl Default for TransferSettings {
     fn default() -> Self {
         Self {
+            backend: BackendKind::Croc,
             croc_executable: PathBuf::from("croc"),
             default_receive_directory: default_receive_directory(),
             timeout: DEFAULT_TIMEOUT,
@@ -130,6 +132,7 @@ impl fmt::Debug for TransferSettings {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TransferSettings")
+            .field("backend", &self.backend)
             .field(
                 "croc_executable_configured",
                 &!self.croc_executable.as_os_str().is_empty(),
@@ -141,6 +144,14 @@ impl fmt::Debug for TransferSettings {
             .field("timeout", &self.timeout)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    #[default]
+    Croc,
+    Native,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,8 +521,32 @@ mod tests {
             .load()
             .unwrap();
         assert_eq!(loaded.settings, DriftSettings::default());
+        assert_eq!(loaded.settings.transfer.backend, BackendKind::Croc);
         assert_eq!(loaded.source, SettingsSource::Defaults);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn backend_selection_uses_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&BackendKind::Croc).unwrap(),
+            "\"croc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackendKind::Native).unwrap(),
+            "\"native\""
+        );
+
+        let settings: DriftSettings =
+            serde_json::from_str(r#"{"transfer":{"backend":"native"}}"#).unwrap();
+        assert_eq!(settings.transfer.backend, BackendKind::Native);
+    }
+
+    #[test]
+    fn unknown_backend_selection_is_rejected_as_parse_error() {
+        let result: Result<DriftSettings, _> =
+            serde_json::from_str(r#"{"transfer":{"backend":"future"}}"#);
+        assert!(result.is_err());
     }
 
     #[test]

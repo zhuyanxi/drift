@@ -1,94 +1,196 @@
 use async_trait::async_trait;
 use drift_core::TransferFailureKind;
-use std::{fmt, io, path::PathBuf, time::Duration};
+use std::{fmt, future::Future, io, path::PathBuf, pin::Pin, time::Duration};
 use thiserror::Error;
-
-use crate::TransferHandle;
 
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error("invalid backend request: {0}")]
-    InvalidRequest(String),
-    #[error(
-        "croc executable not found at {executable}; install Croc v11.2.x or configure its path"
-    )]
-    ExecutableMissing { executable: PathBuf },
-    #[error("failed to spawn backend process")]
-    Spawn(#[source] io::Error),
-    #[error("backend process I/O failed")]
+    InvalidRequest(BackendRequestError),
+    #[error("backend is unavailable: {reason}")]
+    Unavailable { reason: BackendUnavailableReason },
+    #[error("backend I/O failed")]
     Io(#[source] io::Error),
-    #[error("backend output task failed")]
-    OutputTask(#[source] tokio::task::JoinError),
-    #[error("backend process timed out after {timeout:?}")]
+    #[error("backend task failed")]
+    Task(#[source] tokio::task::JoinError),
+    #[error("backend operation timed out after {timeout:?}")]
     Timeout { timeout: Duration },
-    #[error("backend process cancelled")]
+    #[error("backend operation cancelled")]
     Cancelled,
-    #[error("croc version invocation failed")]
-    VersionInvocation,
-    #[error("unsupported croc version {found}; Drift supports {supported}")]
-    UnsupportedVersion {
+    #[error("backend version {found} is unsupported; expected {supported}")]
+    IncompatibleVersion {
         found: String,
         supported: &'static str,
     },
-    #[error("croc version output was not recognized")]
-    InvalidVersionOutput,
-    #[error("croc {stream} output violated the supported contract: {reason}")]
-    OutputParse {
-        stream: &'static str,
-        reason: &'static str,
-    },
-    #[error("croc did not provide the required {signal} signal")]
-    MissingSignal { signal: &'static str },
-    #[error("croc {stream} output exceeded the bounded diagnostic limit")]
-    OutputLimit { stream: &'static str },
-    #[error("backend process exited with code {code:?}: {stderr}")]
-    ProcessFailed { code: Option<i32>, stderr: String },
-    #[error("backend process did not provide {stream} pipe")]
-    MissingPipe { stream: &'static str },
+    #[error("backend protocol failure: {reason}")]
+    Protocol { reason: BackendProtocolError },
+    #[error("backend operation failed: {reason}")]
+    OperationFailed { reason: BackendOperationError },
 }
 
 impl BackendError {
     pub fn failure_kind(&self) -> TransferFailureKind {
         match self {
             Self::InvalidRequest(_) => TransferFailureKind::InvalidRequest,
-            Self::ExecutableMissing { .. } | Self::Spawn(_) | Self::MissingPipe { .. } => {
-                TransferFailureKind::Filesystem
-            }
-            Self::Io(_) | Self::OutputTask(_) => TransferFailureKind::ProcessInterruption,
+            Self::Unavailable { reason } => match reason {
+                BackendUnavailableReason::DependencyMissing => TransferFailureKind::Filesystem,
+                BackendUnavailableReason::NotImplemented
+                | BackendUnavailableReason::NotConfigured
+                | BackendUnavailableReason::UnsupportedPlatform => TransferFailureKind::Unknown,
+            },
+            Self::Io(_) | Self::Task(_) => TransferFailureKind::ProcessInterruption,
             Self::Timeout { .. } => TransferFailureKind::Network,
             Self::Cancelled => TransferFailureKind::Unknown,
-            Self::VersionInvocation
-            | Self::UnsupportedVersion { .. }
-            | Self::InvalidVersionOutput
-            | Self::OutputParse { .. }
-            | Self::MissingSignal { .. }
-            | Self::OutputLimit { .. }
-            | Self::ProcessFailed { .. } => TransferFailureKind::ProcessFailure,
+            Self::IncompatibleVersion { .. }
+            | Self::Protocol { .. }
+            | Self::OperationFailed { .. } => TransferFailureKind::ProcessFailure,
         }
     }
 
     pub fn safe_message(&self) -> String {
         match self {
-            Self::InvalidRequest(_) => "invalid backend request".into(),
-            Self::ExecutableMissing { executable } => format!(
-                "croc executable unavailable at {}; install Croc v11.2.x or configure its path",
-                executable.display()
-            ),
-            Self::Spawn(_) => "failed to start the croc process".into(),
-            Self::Io(_) => "croc process I/O failed".into(),
-            Self::OutputTask(_) => "croc output reader failed".into(),
-            Self::Timeout { .. } => "croc process timed out".into(),
-            Self::Cancelled => "croc process cancelled".into(),
-            Self::VersionInvocation => "croc version check failed".into(),
-            Self::UnsupportedVersion { found, supported } => {
-                format!("unsupported croc version {found}; Drift supports {supported}")
-            }
-            Self::InvalidVersionOutput => "croc version output was not recognized".into(),
-            Self::OutputParse { .. } => "croc output was not recognized".into(),
-            Self::MissingSignal { signal } => format!("croc did not provide {signal}"),
-            Self::OutputLimit { .. } => "croc output exceeded the diagnostic limit".into(),
-            Self::ProcessFailed { .. } => "croc process failed".into(),
-            Self::MissingPipe { .. } => "croc process output was unavailable".into(),
+            Self::InvalidRequest(reason) => reason.safe_message().into(),
+            Self::Unavailable { reason } => reason.safe_message().into(),
+            Self::Io(_) => "backend I/O failed".into(),
+            Self::Task(_) => "backend task failed".into(),
+            Self::Timeout { .. } => "backend operation timed out".into(),
+            Self::Cancelled => "backend operation cancelled".into(),
+            Self::IncompatibleVersion { .. } => "backend version is unsupported".into(),
+            Self::Protocol { reason } => reason.safe_message().into(),
+            Self::OperationFailed { reason } => reason.safe_message().into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendRequestError {
+    EmptyPaths,
+    EmptyCode,
+    EmptyOutputDirectory,
+}
+
+impl BackendRequestError {
+    pub const fn safe_message(self) -> &'static str {
+        match self {
+            Self::EmptyPaths => "send request must contain at least one path",
+            Self::EmptyCode => "receive request code must not be empty",
+            Self::EmptyOutputDirectory => "receive request output directory must not be empty",
+        }
+    }
+}
+
+impl fmt::Display for BackendRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.safe_message())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendProtocolError {
+    VersionCheckFailed,
+    UnrecognizedVersion,
+    MalformedMessage,
+    MissingRequiredSignal,
+}
+
+impl BackendProtocolError {
+    pub const fn safe_message(self) -> &'static str {
+        match self {
+            Self::VersionCheckFailed => "backend version check failed",
+            Self::UnrecognizedVersion => "backend version was not recognized",
+            Self::MalformedMessage => "backend protocol response was not recognized",
+            Self::MissingRequiredSignal => "backend did not provide a required signal",
+        }
+    }
+}
+
+impl fmt::Display for BackendProtocolError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.safe_message())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendOperationError {
+    StartupFailed,
+    ExecutionFailed,
+    ResourceLimit,
+    Internal,
+}
+
+impl BackendOperationError {
+    pub const fn safe_message(self) -> &'static str {
+        match self {
+            Self::StartupFailed => "backend could not start",
+            Self::ExecutionFailed => "backend operation failed",
+            Self::ResourceLimit => "backend output exceeded its limit",
+            Self::Internal => "backend operation failed internally",
+        }
+    }
+}
+
+impl fmt::Display for BackendOperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.safe_message())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendUnavailableReason {
+    DependencyMissing,
+    NotImplemented,
+    NotConfigured,
+    UnsupportedPlatform,
+}
+
+impl BackendUnavailableReason {
+    pub const fn safe_message(self) -> &'static str {
+        match self {
+            Self::DependencyMissing => "backend dependency is unavailable",
+            Self::NotImplemented => "backend is not implemented",
+            Self::NotConfigured => "backend is not configured",
+            Self::UnsupportedPlatform => "backend is unavailable on this platform",
+        }
+    }
+}
+
+impl fmt::Display for BackendUnavailableReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DependencyMissing => "dependency missing",
+            Self::NotImplemented => "not implemented",
+            Self::NotConfigured => "not configured",
+            Self::UnsupportedPlatform => "unsupported platform",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendAvailability {
+    Ready,
+    Unavailable { reason: BackendUnavailableReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendInfo {
+    pub name: &'static str,
+    pub version: Option<&'static str>,
+    pub capabilities: BackendCapabilities,
+    pub availability: BackendAvailability,
+}
+
+impl BackendInfo {
+    pub const fn new(
+        name: &'static str,
+        version: Option<&'static str>,
+        capabilities: BackendCapabilities,
+        availability: BackendAvailability,
+    ) -> Self {
+        Self {
+            name,
+            version,
+            capabilities,
+            availability,
         }
     }
 }
@@ -98,6 +200,8 @@ pub enum BackendCapability {
     Progress,
     Pause,
     Resume,
+    Direct,
+    Relay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +209,8 @@ pub struct BackendCapabilities {
     progress: bool,
     pause: bool,
     resume: bool,
+    direct: bool,
+    relay: bool,
 }
 
 impl BackendCapabilities {
@@ -113,7 +219,15 @@ impl BackendCapabilities {
             progress,
             pause,
             resume,
+            direct: false,
+            relay: false,
         }
+    }
+
+    pub const fn with_connection_modes(mut self, direct: bool, relay: bool) -> Self {
+        self.direct = direct;
+        self.relay = relay;
+        self
     }
 
     pub const fn supports(self, capability: BackendCapability) -> bool {
@@ -121,6 +235,8 @@ impl BackendCapabilities {
             BackendCapability::Progress => self.progress,
             BackendCapability::Pause => self.pause,
             BackendCapability::Resume => self.resume,
+            BackendCapability::Direct => self.direct,
+            BackendCapability::Relay => self.relay,
         }
     }
 }
@@ -131,9 +247,20 @@ impl fmt::Display for BackendCapability {
             Self::Progress => formatter.write_str("progress reporting"),
             Self::Pause => formatter.write_str("pause"),
             Self::Resume => formatter.write_str("resume"),
+            Self::Direct => formatter.write_str("direct connections"),
+            Self::Relay => formatter.write_str("relay connections"),
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendControlResult {
+    Confirmed,
+    Unsupported,
+    Terminal,
+}
+
+pub type BackendCancellation = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum BackendEvent {
@@ -187,7 +314,7 @@ impl SendRequest {
     pub fn new(paths: Vec<PathBuf>) -> Result<Self, BackendError> {
         if paths.is_empty() {
             return Err(BackendError::InvalidRequest(
-                "send request must contain at least one path".into(),
+                BackendRequestError::EmptyPaths,
             ));
         }
         Ok(Self { paths, relay: None })
@@ -223,14 +350,12 @@ impl ReceiveRequest {
     ) -> Result<Self, BackendError> {
         let code = code.into();
         if code.trim().is_empty() {
-            return Err(BackendError::InvalidRequest(
-                "receive request code must not be empty".into(),
-            ));
+            return Err(BackendError::InvalidRequest(BackendRequestError::EmptyCode));
         }
         let output_directory = output_directory.into();
         if output_directory.as_os_str().is_empty() {
             return Err(BackendError::InvalidRequest(
-                "receive request output directory must not be empty".into(),
+                BackendRequestError::EmptyOutputDirectory,
             ));
         }
         Ok(Self {
@@ -258,18 +383,69 @@ impl fmt::Debug for ReceiveRequest {
 }
 
 #[async_trait]
+pub trait TransferHandle: Send {
+    fn take_updates(&mut self) -> Option<tokio::sync::mpsc::Receiver<BackendEvent>>;
+
+    async fn wait(self: Box<Self>) -> Result<(), BackendError>;
+
+    async fn wait_with_cancel_signal(
+        self: Box<Self>,
+        cancellation: BackendCancellation,
+    ) -> Result<(), BackendError>;
+
+    async fn cancel(&mut self) -> Result<BackendControlResult, BackendError>;
+
+    async fn pause(&mut self) -> Result<BackendControlResult, BackendError> {
+        Ok(BackendControlResult::Unsupported)
+    }
+
+    async fn resume(&mut self) -> Result<BackendControlResult, BackendError> {
+        Ok(BackendControlResult::Unsupported)
+    }
+}
+
+#[async_trait]
 pub trait TransferBackend: Send + Sync {
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::default()
+    fn name(&self) -> &'static str {
+        "unknown"
     }
 
     fn version(&self) -> Option<&'static str> {
         None
     }
 
-    async fn send(&self, request: SendRequest) -> Result<TransferHandle, BackendError>;
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
 
-    async fn receive(&self, request: ReceiveRequest) -> Result<TransferHandle, BackendError>;
+    fn availability(&self) -> BackendAvailability {
+        BackendAvailability::Ready
+    }
+
+    fn info(&self) -> BackendInfo {
+        BackendInfo::new(
+            self.name(),
+            self.version(),
+            self.capabilities(),
+            self.availability(),
+        )
+    }
+
+    async fn check_ready(&self) -> Result<(), BackendError> {
+        match self.availability() {
+            BackendAvailability::Ready => Ok(()),
+            BackendAvailability::Unavailable { reason } => {
+                Err(BackendError::Unavailable { reason })
+            }
+        }
+    }
+
+    async fn send(&self, request: SendRequest) -> Result<Box<dyn TransferHandle>, BackendError>;
+
+    async fn receive(
+        &self,
+        request: ReceiveRequest,
+    ) -> Result<Box<dyn TransferHandle>, BackendError>;
 }
 
 #[cfg(test)]
@@ -305,15 +481,14 @@ mod tests {
             TransferFailureKind::ProcessInterruption
         );
         assert_eq!(
-            BackendError::ProcessFailed {
-                code: Some(1),
-                stderr: String::new(),
+            BackendError::OperationFailed {
+                reason: BackendOperationError::ExecutionFailed,
             }
             .failure_kind(),
             TransferFailureKind::ProcessFailure
         );
         assert_eq!(
-            BackendError::InvalidRequest("bad request".into()).failure_kind(),
+            BackendError::InvalidRequest(BackendRequestError::EmptyPaths).failure_kind(),
             TransferFailureKind::InvalidRequest
         );
         assert!(
@@ -326,8 +501,27 @@ mod tests {
     #[test]
     fn backend_capabilities_are_explicit_for_pause_resume() {
         let backend = crate::CrocBackend::default();
+        let info = backend.info();
+
+        assert_eq!(info.name, "croc");
+        assert_eq!(info.version, Some("11.2.x"));
+        assert_eq!(info.availability, BackendAvailability::Ready);
         assert!(!backend.capabilities().supports(BackendCapability::Pause));
         assert!(!backend.capabilities().supports(BackendCapability::Resume));
+        assert!(backend.capabilities().supports(BackendCapability::Direct));
+        assert!(backend.capabilities().supports(BackendCapability::Relay));
         assert_eq!(backend.version(), Some("11.2.x"));
+    }
+
+    #[test]
+    fn control_result_distinguishes_confirmed_unsupported_and_terminal() {
+        assert_ne!(
+            BackendControlResult::Confirmed,
+            BackendControlResult::Unsupported
+        );
+        assert_ne!(
+            BackendControlResult::Unsupported,
+            BackendControlResult::Terminal
+        );
     }
 }

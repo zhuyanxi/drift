@@ -4,8 +4,8 @@ use drift_core::{
     TransferState, DEFAULT_RESUME_CHUNK_SIZE, RESUME_SCHEMA_VERSION,
 };
 use drift_protocol::{
-    BackendCapabilities, BackendCapability, BackendError, BackendEvent, ReceiveRequest,
-    SendRequest, TransferBackend, TransferHandle,
+    BackendCancellation, BackendCapabilities, BackendCapability, BackendError, BackendEvent,
+    BackendProtocolError, ReceiveRequest, SendRequest, TransferBackend, TransferHandle,
 };
 use drift_storage::{
     DestinationError, JsonStore, ReceiveStaging, ReceiveStagingError, StorageError,
@@ -21,8 +21,8 @@ pub struct TransferNotification {
     pub event: TransferEvent,
 }
 
-struct ManagerInner<B> {
-    backend: Arc<B>,
+struct ManagerInner {
+    backend: Arc<dyn TransferBackend>,
     backend_name: String,
     sessions: RwLock<HashMap<TransferId, TransferSession>>,
     completed_receive_destinations: RwLock<HashMap<TransferId, PathBuf>>,
@@ -50,39 +50,54 @@ enum RetryRequest {
 }
 
 #[derive(Clone)]
-pub struct TransferManager<B> {
-    inner: Arc<ManagerInner<B>>,
+pub struct TransferManager {
+    inner: Arc<ManagerInner>,
 }
 
-impl<B> TransferManager<B>
-where
-    B: TransferBackend + 'static,
-{
-    pub fn new(backend: B) -> Self {
-        Self::with_backend_name(backend, "croc")
+impl TransferManager {
+    pub fn new<B>(backend: B) -> Self
+    where
+        B: TransferBackend + 'static,
+    {
+        let backend_name = backend.info().name.to_owned();
+        Self::with_backend_arc(Arc::new(backend), backend_name, None)
     }
 
-    pub fn with_backend_name(backend: B, backend_name: impl Into<String>) -> Self {
-        Self::with_optional_resume_store(backend, backend_name, None)
+    pub fn with_backend_name<B>(backend: B, backend_name: impl Into<String>) -> Self
+    where
+        B: TransferBackend + 'static,
+    {
+        Self::with_backend_arc(Arc::new(backend), backend_name, None)
     }
 
-    pub fn with_resume_store(
+    pub fn with_resume_store<B>(
         backend: B,
         backend_name: impl Into<String>,
         resume_store: JsonStore,
-    ) -> Self {
-        Self::with_optional_resume_store(backend, backend_name, Some(resume_store))
+    ) -> Self
+    where
+        B: TransferBackend + 'static,
+    {
+        Self::with_backend_arc(Arc::new(backend), backend_name, Some(resume_store))
     }
 
-    fn with_optional_resume_store(
-        backend: B,
+    pub fn with_resume_store_arc(
+        backend: Arc<dyn TransferBackend>,
+        backend_name: impl Into<String>,
+        resume_store: JsonStore,
+    ) -> Self {
+        Self::with_backend_arc(backend, backend_name, Some(resume_store))
+    }
+
+    fn with_backend_arc(
+        backend: Arc<dyn TransferBackend>,
         backend_name: impl Into<String>,
         resume_store: Option<JsonStore>,
     ) -> Self {
         let (events, _) = broadcast::channel(64);
         Self {
             inner: Arc::new(ManagerInner {
-                backend: Arc::new(backend),
+                backend,
                 backend_name: backend_name.into(),
                 sessions: RwLock::new(HashMap::new()),
                 completed_receive_destinations: RwLock::new(HashMap::new()),
@@ -102,8 +117,12 @@ where
         self.inner.backend.capabilities()
     }
 
+    pub fn backend_info(&self) -> drift_protocol::BackendInfo {
+        self.inner.backend.info()
+    }
+
     pub fn backend_version(&self) -> Option<&'static str> {
-        self.inner.backend.version()
+        self.inner.backend.info().version
     }
 
     pub async fn pause(&self, transfer_id: TransferId) -> Result<(), TransferError> {
@@ -591,7 +610,7 @@ where
     async fn track_and_monitor(
         &self,
         transfer_id: TransferId,
-        mut handle: TransferHandle,
+        mut handle: Box<dyn TransferHandle>,
         cancellation: watch::Receiver<bool>,
     ) {
         let mut updates = handle.take_updates();
@@ -599,7 +618,8 @@ where
             inner: Arc::clone(&self.inner),
         };
         tokio::spawn(async move {
-            let cancellation_wait = wait_for_cancellation(cancellation.clone());
+            let cancellation_wait: BackendCancellation =
+                Box::pin(wait_for_cancellation(cancellation.clone()));
             let mut completion = Box::pin(handle.wait_with_cancel_signal(cancellation_wait));
             let mut update_error = None;
             let result = loop {
@@ -653,9 +673,8 @@ where
                         TransferEvent::MetadataReady,
                     )
                     .await
-                    .map_err(|_| BackendError::OutputParse {
-                        stream: "metadata",
-                        reason: "invalid metadata state",
+                    .map_err(|_| BackendError::Protocol {
+                        reason: BackendProtocolError::MalformedMessage,
                     })?;
                 }
             }
@@ -671,18 +690,16 @@ where
                     Ok(()) => {}
                     Err(error @ TransferError::InvalidProgress(_)) => {
                         warn!(%transfer_id, %error, "invalid backend progress event");
-                        return Err(BackendError::OutputParse {
-                            stream: "progress",
-                            reason: "invalid progress update",
+                        return Err(BackendError::Protocol {
+                            reason: BackendProtocolError::MalformedMessage,
                         });
                     }
                     Err(error @ TransferError::ProgressNotAllowed(_)) => {
                         warn!(%transfer_id, %error, "ignored invalid or late progress event");
                     }
                     Err(_) => {
-                        return Err(BackendError::OutputParse {
-                            stream: "progress",
-                            reason: "missing transfer session",
+                        return Err(BackendError::Protocol {
+                            reason: BackendProtocolError::MalformedMessage,
                         });
                     }
                 }
@@ -692,6 +709,7 @@ where
                     BackendCapability::Progress => TransferCapability::Progress,
                     BackendCapability::Pause => TransferCapability::Pause,
                     BackendCapability::Resume => TransferCapability::Resume,
+                    BackendCapability::Direct | BackendCapability::Relay => return Ok(()),
                 };
                 self.emit(
                     transfer_id,
@@ -713,18 +731,14 @@ where
     }
 
     #[cfg(test)]
-    async fn finish(
-        &self,
-        transfer_id: TransferId,
-        result: Result<drift_protocol::TransferOutput, BackendError>,
-    ) {
+    async fn finish(&self, transfer_id: TransferId, result: Result<(), BackendError>) {
         self.finish_attempt(transfer_id, result, false).await;
     }
 
     async fn finish_attempt(
         &self,
         transfer_id: TransferId,
-        result: Result<drift_protocol::TransferOutput, BackendError>,
+        result: Result<(), BackendError>,
         cancelled: bool,
     ) {
         if cancelled || matches!(&result, Err(BackendError::Cancelled)) {
@@ -750,9 +764,8 @@ where
                     let _ = self
                         .fail(
                             transfer_id,
-                            BackendError::OutputParse {
-                                stream: "state",
-                                reason: "invalid verification state",
+                            BackendError::Protocol {
+                                reason: BackendProtocolError::MalformedMessage,
                             },
                         )
                         .await;
@@ -1301,9 +1314,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             &error,
-            BackendError::OutputParse {
-                stream: "progress",
-                reason: "invalid progress update",
+            BackendError::Protocol {
+                reason: BackendProtocolError::MalformedMessage,
             }
         ));
 
@@ -1428,7 +1440,7 @@ mod tests {
             }
         }
         let session = manager.session(transfer_id).await.unwrap();
-        assert_eq!(session.error.as_deref(), Some("croc process failed"));
+        assert_eq!(session.error.as_deref(), Some("backend operation failed"));
         assert!(!session
             .error
             .as_deref()

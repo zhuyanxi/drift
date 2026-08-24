@@ -83,7 +83,7 @@ async fn process_failure_is_typed_safe_and_not_retryable() {
         session.failure_kind,
         Some(TransferFailureKind::ProcessFailure)
     );
-    assert_eq!(session.error.as_deref(), Some("croc process failed"));
+    assert_eq!(session.error.as_deref(), Some("backend operation failed"));
     assert!(!session
         .error
         .as_deref()
@@ -117,7 +117,10 @@ async fn relay_failure_is_typed_safe_and_not_retryable() {
     let session = manager.session(transfer_id).await.unwrap();
     assert_eq!(session.state, TransferState::Failed);
     assert_eq!(session.failure_kind, Some(TransferFailureKind::Network));
-    assert_eq!(session.error.as_deref(), Some("croc process timed out"));
+    assert_eq!(
+        session.error.as_deref(),
+        Some("backend operation timed out")
+    );
     let retry_id = manager.retry(transfer_id).await.unwrap();
     assert_ne!(retry_id, transfer_id);
     manager.cancel(retry_id).await.unwrap();

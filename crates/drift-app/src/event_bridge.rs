@@ -1,7 +1,6 @@
 use drift_core::{
     Progress, Role, TransferEvent, TransferFailureKind, TransferId, TransferSession, TransferState,
 };
-use drift_protocol::CrocBackend;
 use drift_transfer::{TransferManager, TransferNotification};
 use std::{
     collections::{HashMap, HashSet},
@@ -77,7 +76,7 @@ pub(crate) struct AppEventBridge {
 }
 
 impl AppEventBridge {
-    pub(crate) fn start(runtime: &Handle, manager: TransferManager<CrocBackend>) -> Self {
+    pub(crate) fn start(runtime: &Handle, manager: TransferManager) -> Self {
         let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let bus = Arc::new(EventBus {
             sender: Mutex::new(Some(sender.clone())),
@@ -120,7 +119,7 @@ impl AppEventBridge {
 }
 
 async fn run_event_bridge(
-    manager: TransferManager<CrocBackend>,
+    manager: TransferManager,
     mut receiver: broadcast::Receiver<TransferNotification>,
     sender: broadcast::Sender<AppTransferUpdate>,
     bus: Arc<EventBus>,
@@ -160,7 +159,7 @@ async fn run_event_bridge(
 }
 
 async fn build_update(
-    manager: &TransferManager<CrocBackend>,
+    manager: &TransferManager,
     presentations: &RwLock<HashMap<TransferId, TransferPresentation>>,
     notification: TransferNotification,
 ) -> Option<AppTransferUpdate> {
@@ -313,7 +312,7 @@ fn accepts_event(previous: TransferState, event: &TransferEvent) -> bool {
 }
 
 async fn refresh_sessions(
-    manager: &TransferManager<CrocBackend>,
+    manager: &TransferManager,
     presentations: &RwLock<HashMap<TransferId, TransferPresentation>>,
     sender: &broadcast::Sender<AppTransferUpdate>,
     pending_progress: &mut HashMap<TransferId, AppTransferUpdate>,
@@ -423,6 +422,7 @@ fn closed_receiver() -> broadcast::Receiver<AppTransferUpdate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use drift_protocol::CrocBackend;
 
     fn presentation(transfer_id: TransferId, state: TransferState) -> TransferPresentation {
         TransferPresentation {

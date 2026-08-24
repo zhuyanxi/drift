@@ -1,13 +1,16 @@
 use crate::event_bridge::{AppEventBridge, AppTransferUpdate, TransferPresentation};
 use crate::platform::{DestinationRevealer, RevealError, SystemDestinationRevealer};
 use crate::settings::{
-    ConfigPathError, DriftSettings, RelaySettings, SettingsError, SettingsLoader, SettingsSource,
-    SettingsStore,
+    BackendKind, ConfigPathError, DriftSettings, RelaySettings, SettingsError, SettingsLoader,
+    SettingsSource, SettingsStore,
 };
 use drift_core::{
     ResumeRequest, ResumeState, TransferCapability, TransferError, TransferId, TransferManifest,
 };
-use drift_protocol::{BackendCapabilities, BackendError, CrocBackend, ReceiveRequest, SendRequest};
+use drift_protocol::{
+    BackendCapabilities, BackendError, CrocBackend, NativeBackend, ReceiveRequest, SendRequest,
+    TransferBackend,
+};
 use drift_storage::{
     scan_send_paths, validate_receive_directory, DestinationError, JsonStore, ResumeDiscovery,
     ScanCancellation, SourceScan, SourceScanError, StorageError,
@@ -51,8 +54,8 @@ pub struct AppState {
     settings: DriftSettings,
     settings_source: SettingsSource,
     config_path: PathBuf,
-    backend: CrocBackend,
-    transfer_manager: TransferManager<CrocBackend>,
+    backend: Arc<dyn TransferBackend>,
+    transfer_manager: TransferManager,
     event_bridge: AppEventBridge,
     resume_store: JsonStore,
     settings_store: SettingsStore,
@@ -83,14 +86,14 @@ impl AppState {
     }
 
     pub fn backend_name(&self) -> &'static str {
-        "croc"
+        self.backend.info().name
     }
 
     pub fn custom_relay_configured(&self) -> bool {
         self.settings.relay.effective_url().is_some()
     }
 
-    pub fn transfer_manager(&self) -> &TransferManager<CrocBackend> {
+    pub fn transfer_manager(&self) -> &TransferManager {
         &self.transfer_manager
     }
 
@@ -117,12 +120,20 @@ impl AppState {
             .enable_all()
             .build()
             .map_err(AppError::Runtime)?;
-        let backend = CrocBackend::new(&loaded.settings.transfer.croc_executable)
-            .with_timeout(loaded.settings.transfer.timeout);
+        let backend: Arc<dyn TransferBackend> = match loaded.settings.transfer.backend {
+            BackendKind::Croc => Arc::new(
+                CrocBackend::new(&loaded.settings.transfer.croc_executable)
+                    .with_timeout(loaded.settings.transfer.timeout),
+            ),
+            BackendKind::Native => Arc::new(NativeBackend::new()),
+        };
         let settings_store = SettingsStore::new(loader.clone(), loaded.settings.clone());
         let resume_store = JsonStore::new(resume_root(loader.path()));
-        let transfer_manager =
-            TransferManager::with_resume_store(backend.clone(), "croc", resume_store.clone());
+        let transfer_manager = TransferManager::with_resume_store_arc(
+            Arc::clone(&backend),
+            backend.info().name,
+            resume_store.clone(),
+        );
         let event_bridge = AppEventBridge::start(runtime.handle(), transfer_manager.clone());
 
         Ok(Self {
@@ -143,8 +154,8 @@ impl AppState {
 #[derive(Clone)]
 pub struct AppHandle {
     runtime: Handle,
-    backend: CrocBackend,
-    transfer_manager: TransferManager<CrocBackend>,
+    backend: Arc<dyn TransferBackend>,
+    transfer_manager: TransferManager,
     event_bridge: AppEventBridge,
     resume_store: JsonStore,
     settings_store: SettingsStore,
@@ -169,7 +180,7 @@ impl AppHandle {
         let backend = self.backend.clone();
         self.runtime.spawn(async move {
             backend
-                .preflight()
+                .check_ready()
                 .await
                 .map(|_| ())
                 .map_err(AppCommandError::Preflight)
@@ -413,6 +424,9 @@ pub enum AppCommandError {
 impl AppCommandError {
     pub fn user_message(&self) -> &'static str {
         match self {
+            Self::Preflight(BackendError::Unavailable { .. }) => {
+                "The selected backend is not ready."
+            }
             Self::Preflight(_) => "Croc is not ready.",
             Self::InvalidRequest(_) => "The transfer request is invalid.",
             Self::EmptyOutputDirectory => "The receive folder is unavailable.",
@@ -481,7 +495,7 @@ impl From<SettingsError> for AppCommandError {
 }
 
 async fn dispatch_command(
-    transfer_manager: TransferManager<CrocBackend>,
+    transfer_manager: TransferManager,
     resume_store: JsonStore,
     settings_store: SettingsStore,
     default_receive_directory: PathBuf,
@@ -693,6 +707,38 @@ mod tests {
         );
         assert_eq!(state.backend_name(), "croc");
         assert!(!state.custom_relay_configured());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composes_native_backend_and_reports_typed_unavailability() {
+        let root = temp_path();
+        let config_path = root.join("config").join("config.json");
+        let receive_directory = root.join("received");
+        fs::create_dir_all(&receive_directory).unwrap();
+        let mut settings = DriftSettings::default();
+        settings.transfer.backend = BackendKind::Native;
+        settings.transfer.default_receive_directory = receive_directory;
+
+        SettingsLoader::with_path(&config_path)
+            .save(&settings)
+            .unwrap();
+        let state = AppState::bootstrap_with_config_path(&config_path).unwrap();
+
+        assert_eq!(state.backend_name(), "native");
+        assert_eq!(state.transfer_manager().backend_info().name, "native");
+        let result = state.runtime.block_on(state.handle().preflight()).unwrap();
+        assert!(matches!(
+            result,
+            Err(AppCommandError::Preflight(BackendError::Unavailable { .. }))
+        ));
+        assert_eq!(
+            AppCommandError::Preflight(BackendError::Unavailable {
+                reason: drift_protocol::BackendUnavailableReason::NotImplemented,
+            })
+            .user_message(),
+            "The selected backend is not ready."
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

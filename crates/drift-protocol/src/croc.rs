@@ -1,12 +1,13 @@
-use crate::{
-    BackendCapabilities, BackendCapability, BackendError, BackendEvent, ReceiveRequest,
-    SendRequest, TransferBackend,
+use crate::backend::{
+    BackendAvailability, BackendCancellation, BackendCapabilities, BackendCapability,
+    BackendControlResult, BackendError, BackendEvent, BackendOperationError, BackendProtocolError,
+    BackendRequestError, BackendUnavailableReason, ReceiveRequest, SendRequest, TransferBackend,
+    TransferHandle,
 };
 use async_trait::async_trait;
 use std::{
     ffi::OsString,
     fmt,
-    future::Future,
     path::{Path, PathBuf},
     process::ExitStatus,
     time::Duration,
@@ -109,14 +110,12 @@ impl CrocBackend {
         let mut child = command
             .spawn()
             .map_err(|error| map_spawn_error(&self.executable, error))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(BackendError::MissingPipe { stream: "stdout" })?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(BackendError::MissingPipe { stream: "stderr" })?;
+        let stdout = child.stdout.take().ok_or(BackendError::OperationFailed {
+            reason: BackendOperationError::Internal,
+        })?;
+        let stderr = child.stderr.take().ok_or(BackendError::OperationFailed {
+            reason: BackendOperationError::Internal,
+        })?;
         let stdout_task = tokio::spawn(read_bounded(stdout, VERSION_OUTPUT_LIMIT));
         let stderr_task = tokio::spawn(read_bounded(stderr, VERSION_OUTPUT_LIMIT));
 
@@ -140,18 +139,23 @@ impl CrocBackend {
         let stdout = join_bounded(stdout_task).await?;
         let stderr = join_bounded(stderr_task).await?;
         if stdout.truncated || stderr.truncated {
-            return Err(BackendError::OutputLimit { stream: "version" });
+            return Err(BackendError::OperationFailed {
+                reason: BackendOperationError::ResourceLimit,
+            });
         }
         if !status.success() {
-            return Err(BackendError::VersionInvocation);
+            return Err(BackendError::Protocol {
+                reason: BackendProtocolError::VersionCheckFailed,
+            });
         }
 
         let mut version_output = stdout.bytes;
         version_output.extend_from_slice(&stderr.bytes);
-        let version =
-            parse_croc_version(&version_output).ok_or(BackendError::InvalidVersionOutput)?;
+        let version = parse_croc_version(&version_output).ok_or(BackendError::Protocol {
+            reason: BackendProtocolError::UnrecognizedVersion,
+        })?;
         if !version.is_supported() {
-            return Err(BackendError::UnsupportedVersion {
+            return Err(BackendError::IncompatibleVersion {
                 found: version.to_string(),
                 supported: SUPPORTED_CROC_VERSION_RANGE,
             });
@@ -162,7 +166,7 @@ impl CrocBackend {
     fn send_args(&self, request: &SendRequest) -> Result<Vec<OsString>, BackendError> {
         if request.paths.is_empty() {
             return Err(BackendError::InvalidRequest(
-                "send request must contain at least one path".into(),
+                BackendRequestError::EmptyPaths,
             ));
         }
         let mut args = self.relay_args(request.relay.as_deref());
@@ -174,9 +178,7 @@ impl CrocBackend {
 
     fn receive_args(&self, request: &ReceiveRequest) -> Result<Vec<OsString>, BackendError> {
         if request.code.trim().is_empty() {
-            return Err(BackendError::InvalidRequest(
-                "receive request code must not be empty".into(),
-            ));
+            return Err(BackendError::InvalidRequest(BackendRequestError::EmptyCode));
         }
         let mut args = self.relay_args(request.relay.as_deref());
         args.push(OsString::from("--yes"));
@@ -199,7 +201,7 @@ impl CrocBackend {
         role: &'static str,
         secret: Option<&str>,
         requires_code: bool,
-    ) -> Result<TransferHandle, BackendError> {
+    ) -> Result<CrocTransferHandle, BackendError> {
         debug!(role, argument_count = args.len(), "starting croc backend");
         let mut command = Command::new(&self.executable);
         command
@@ -215,22 +217,20 @@ impl CrocBackend {
         let mut child = command
             .spawn()
             .map_err(|error| map_spawn_error(&self.executable, error))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(BackendError::MissingPipe { stream: "stdout" })?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(BackendError::MissingPipe { stream: "stderr" })?;
+        let stdout = child.stdout.take().ok_or(BackendError::OperationFailed {
+            reason: BackendOperationError::Internal,
+        })?;
+        let stderr = child.stderr.take().ok_or(BackendError::OperationFailed {
+            reason: BackendOperationError::Internal,
+        })?;
         let (updates_sender, updates) = mpsc::channel(32);
         let _ = updates_sender.try_send(BackendEvent::CapabilityUnavailable {
             capability: BackendCapability::Progress,
         });
-        Ok(TransferHandle {
+        Ok(CrocTransferHandle {
             child,
-            stdout_task: Some(read_output(stdout, "stdout", updates_sender.clone())),
-            stderr_task: Some(read_output(stderr, "stderr", updates_sender)),
+            stdout_task: Some(read_output(stdout, updates_sender.clone())),
+            stderr_task: Some(read_output(stderr, updates_sender)),
             updates: Some(updates),
             requires_code,
             redaction_secret: secret.map(str::to_owned),
@@ -358,16 +358,16 @@ where
 async fn join_bounded(
     task: JoinHandle<Result<BoundedOutput, BackendError>>,
 ) -> Result<BoundedOutput, BackendError> {
-    task.await.map_err(BackendError::OutputTask)?
+    task.await.map_err(BackendError::Task)?
 }
 
-fn map_spawn_error(executable: &Path, error: std::io::Error) -> BackendError {
+fn map_spawn_error(_executable: &Path, error: std::io::Error) -> BackendError {
     if error.kind() == std::io::ErrorKind::NotFound {
-        BackendError::ExecutableMissing {
-            executable: executable.to_owned(),
+        BackendError::Unavailable {
+            reason: BackendUnavailableReason::DependencyMissing,
         }
     } else {
-        BackendError::Spawn(error)
+        BackendError::Io(error)
     }
 }
 
@@ -378,29 +378,46 @@ async fn terminate_child(child: &mut Child) {
 
 #[async_trait]
 impl TransferBackend for CrocBackend {
+    fn name(&self) -> &'static str {
+        "croc"
+    }
+
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::new(false, false, false)
+        BackendCapabilities::new(false, false, false).with_connection_modes(true, true)
     }
 
     fn version(&self) -> Option<&'static str> {
         Some(SUPPORTED_CROC_VERSION_RANGE)
     }
 
-    async fn send(&self, request: SendRequest) -> Result<TransferHandle, BackendError> {
-        let args = self.send_args(&request)?;
-        self.preflight().await?;
-        self.spawn(args, "send", None, true).await
+    fn availability(&self) -> BackendAvailability {
+        BackendAvailability::Ready
     }
 
-    async fn receive(&self, request: ReceiveRequest) -> Result<TransferHandle, BackendError> {
+    async fn check_ready(&self) -> Result<(), BackendError> {
+        self.preflight().await.map(|_| ())
+    }
+
+    async fn send(&self, request: SendRequest) -> Result<Box<dyn TransferHandle>, BackendError> {
+        let args = self.send_args(&request)?;
+        self.check_ready().await?;
+        Ok(Box::new(self.spawn(args, "send", None, true).await?))
+    }
+
+    async fn receive(
+        &self,
+        request: ReceiveRequest,
+    ) -> Result<Box<dyn TransferHandle>, BackendError> {
         let args = self.receive_args(&request)?;
-        self.preflight().await?;
-        self.spawn(args, "receive", Some(&request.code), false)
-            .await
+        self.check_ready().await?;
+        Ok(Box::new(
+            self.spawn(args, "receive", Some(&request.code), false)
+                .await?,
+        ))
     }
 }
 
-pub struct TransferHandle {
+struct CrocTransferHandle {
     child: Child,
     stdout_task: Option<JoinHandle<Result<OutputCapture, BackendError>>>,
     stderr_task: Option<JoinHandle<Result<OutputCapture, BackendError>>>,
@@ -410,34 +427,17 @@ pub struct TransferHandle {
     timeout: Duration,
 }
 
-impl TransferHandle {
-    pub fn take_updates(&mut self) -> Option<mpsc::Receiver<BackendEvent>> {
-        self.updates.take()
-    }
-
-    pub async fn wait(mut self) -> Result<TransferOutput, BackendError> {
+impl CrocTransferHandle {
+    async fn wait_inner(mut self) -> Result<(), BackendError> {
         let status = self.wait_for_exit().await?;
         self.finish(status).await
     }
 
-    pub async fn wait_with_cancel(
-        self,
-        cancellation: tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<TransferOutput, BackendError> {
-        self.wait_with_cancel_signal(async move {
-            let _ = cancellation.await;
-        })
-        .await
-    }
-
-    pub async fn wait_with_cancel_signal<F>(
+    async fn wait_with_cancel_signal_inner(
         mut self,
-        cancellation: F,
-    ) -> Result<TransferOutput, BackendError>
-    where
-        F: Future<Output = ()> + Send,
-    {
-        let mut cancellation = Box::pin(cancellation);
+        cancellation: BackendCancellation,
+    ) -> Result<(), BackendError> {
+        let mut cancellation = cancellation;
         let status = tokio::select! {
             result = time::timeout(self.timeout, self.child.wait()) => match result {
                 Ok(Ok(status)) => status,
@@ -474,27 +474,33 @@ impl TransferHandle {
         }
     }
 
-    async fn finish(&mut self, status: ExitStatus) -> Result<TransferOutput, BackendError> {
+    async fn finish(&mut self, status: ExitStatus) -> Result<(), BackendError> {
         let output = self.collect_output().await?;
+        self.validate_completion(status, &output)?;
+        drop(output.stdout);
+        drop(output.stderr);
+        Ok(())
+    }
+
+    fn validate_completion(
+        &self,
+        status: ExitStatus,
+        output: &CollectedOutput,
+    ) -> Result<(), BackendError> {
         if !status.success() {
-            return Err(BackendError::ProcessFailed {
-                code: status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            return Err(BackendError::OperationFailed {
+                reason: BackendOperationError::ExecutionFailed,
             });
         }
         if self.requires_code && output.code.is_none() {
-            return Err(BackendError::MissingSignal {
-                signal: "transfer code",
+            return Err(BackendError::Protocol {
+                reason: BackendProtocolError::MissingRequiredSignal,
             });
         }
-        Ok(TransferOutput {
-            status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        Ok(())
     }
 
-    pub async fn cancel(&mut self) -> Result<(), BackendError> {
+    async fn cancel_inner(&mut self) -> Result<(), BackendError> {
         self.terminate().await;
         let _ = self.collect_output().await?;
         Ok(())
@@ -510,9 +516,8 @@ impl TransferHandle {
         let stderr = join_output(self.stderr_task.take()).await?;
         let code = match (stdout.code.as_deref(), stderr.code.as_deref()) {
             (Some(stdout_code), Some(stderr_code)) if stdout_code != stderr_code => {
-                return Err(BackendError::OutputParse {
-                    stream: "combined",
-                    reason: "multiple transfer code signals",
+                return Err(BackendError::Protocol {
+                    reason: BackendProtocolError::MalformedMessage,
                 });
             }
             (Some(code), _) | (_, Some(code)) => Some(code.to_owned()),
@@ -537,13 +542,48 @@ impl TransferHandle {
         self.terminate().await;
         let _ = self.collect_output().await;
     }
+
+    #[cfg(test)]
+    async fn wait_with_diagnostics(self) -> Result<CrocDiagnostics, BackendError> {
+        let mut handle = self;
+        let status = handle.wait_for_exit().await?;
+        let output = handle.collect_output().await?;
+        handle.validate_completion(status, &output)?;
+        Ok(CrocDiagnostics(output.stdout, output.stderr))
+    }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
-pub struct TransferOutput {
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+#[allow(dead_code)]
+struct CrocDiagnostics(Vec<u8>, Vec<u8>);
+
+#[async_trait]
+impl TransferHandle for CrocTransferHandle {
+    fn take_updates(&mut self) -> Option<mpsc::Receiver<BackendEvent>> {
+        self.updates.take()
+    }
+
+    async fn wait(self: Box<Self>) -> Result<(), BackendError> {
+        (*self).wait_inner().await
+    }
+
+    async fn wait_with_cancel_signal(
+        self: Box<Self>,
+        cancellation: BackendCancellation,
+    ) -> Result<(), BackendError> {
+        (*self).wait_with_cancel_signal_inner(cancellation).await
+    }
+
+    async fn cancel(&mut self) -> Result<BackendControlResult, BackendError> {
+        if self.child.try_wait().map_err(BackendError::Io)?.is_some() {
+            let _ = self.collect_output().await?;
+            return Ok(BackendControlResult::Terminal);
+        }
+        self.cancel_inner()
+            .await
+            .map(|_| BackendControlResult::Confirmed)
+    }
 }
 
 struct CollectedOutput {
@@ -565,7 +605,6 @@ struct BoundedOutput {
 
 fn read_output<R>(
     mut reader: R,
-    stream: &'static str,
     updates: mpsc::Sender<BackendEvent>,
 ) -> JoinHandle<Result<OutputCapture, BackendError>>
 where
@@ -596,13 +635,12 @@ where
             for byte in &buffer[..read] {
                 if *byte == b'\n' {
                     if line_too_long && line.starts_with(b"Code is:") {
-                        return Err(BackendError::OutputParse {
-                            stream,
-                            reason: "invalid transfer code signal",
+                        return Err(BackendError::Protocol {
+                            reason: BackendProtocolError::MalformedMessage,
                         });
                     }
                     if !line_too_long {
-                        observe_line(&line, stream, &mut code, &updates)?;
+                        observe_line(&line, &mut code, &updates)?;
                     }
                     line.clear();
                     line_too_long = false;
@@ -617,7 +655,7 @@ where
         }
 
         if !line.is_empty() && !line_too_long {
-            observe_line(&line, stream, &mut code, &updates)?;
+            observe_line(&line, &mut code, &updates)?;
         }
         Ok(OutputCapture {
             bytes: output,
@@ -630,22 +668,21 @@ where
 async fn join_output(
     task: Option<JoinHandle<Result<OutputCapture, BackendError>>>,
 ) -> Result<OutputCapture, BackendError> {
-    let task = task.ok_or(BackendError::MissingPipe { stream: "output" })?;
-    task.await.map_err(BackendError::OutputTask)?
+    let task = task.ok_or(BackendError::OperationFailed {
+        reason: BackendOperationError::Internal,
+    })?;
+    task.await.map_err(BackendError::Task)?
 }
 
 fn observe_line(
     line: &[u8],
-    stream: &'static str,
     code: &mut Option<String>,
     updates: &mpsc::Sender<BackendEvent>,
 ) -> Result<(), BackendError> {
     let Some(event) = parse_croc_line(&String::from_utf8_lossy(line)).map_err(|error| {
-        BackendError::OutputParse {
-            stream,
-            reason: match error {
-                CrocParseError::InvalidTransferCode => "invalid transfer code signal",
-            },
+        let _ = error;
+        BackendError::Protocol {
+            reason: BackendProtocolError::MalformedMessage,
         }
     })?
     else {
@@ -655,9 +692,8 @@ fn observe_line(
     if let BackendEvent::CodeGenerated { code: value } = &event {
         if let Some(previous) = code {
             if previous != value {
-                return Err(BackendError::OutputParse {
-                    stream,
-                    reason: "multiple transfer code signals",
+                return Err(BackendError::Protocol {
+                    reason: BackendProtocolError::MalformedMessage,
                 });
             }
             return Ok(());
@@ -813,7 +849,9 @@ mod tests {
         );
         assert!(matches!(
             missing.preflight().await,
-            Err(BackendError::ExecutableMissing { .. })
+            Err(BackendError::Unavailable {
+                reason: BackendUnavailableReason::DependencyMissing,
+            })
         ));
 
         let script = write_script(
@@ -822,7 +860,7 @@ mod tests {
         let backend = CrocBackend::new(&script);
         assert!(matches!(
             backend.preflight().await,
-            Err(BackendError::UnsupportedVersion { found, .. }) if found == "11.1.9"
+            Err(BackendError::IncompatibleVersion { found, .. }) if found == "11.1.9"
         ));
         let _ = std::fs::remove_file(script);
     }
@@ -836,7 +874,9 @@ mod tests {
         let backend = CrocBackend::new(&script);
         assert!(matches!(
             backend.preflight().await,
-            Err(BackendError::VersionInvocation)
+            Err(BackendError::Protocol {
+                reason: BackendProtocolError::VersionCheckFailed,
+            })
         ));
         let _ = std::fs::remove_file(script);
     }
@@ -860,9 +900,16 @@ mod tests {
         let script = versioned_script("printf 'Code is: secret-code\\n'; printf 'warning\\n' >&2");
         let backend = CrocBackend::new(&script);
         let request = SendRequest::new(vec![PathBuf::from("ignored")]).unwrap();
-        let output = backend.send(request).await.unwrap().wait().await.unwrap();
-        assert_eq!(output.stdout, b"Code is: [REDACTED]\n");
-        assert_eq!(output.stderr, b"warning\n");
+        let args = backend.send_args(&request).unwrap();
+        let output = backend
+            .spawn(args, "send", None, true)
+            .await
+            .unwrap()
+            .wait_with_diagnostics()
+            .await
+            .unwrap();
+        assert_eq!(output.0, b"Code is: [REDACTED]\n");
+        assert_eq!(output.1, b"warning\n");
         let _ = std::fs::remove_file(script);
     }
 
@@ -904,14 +951,15 @@ mod tests {
         let script = versioned_script("printf 'args=%s\\nsecret=%s\\n' \"$*\" \"$CROC_SECRET\"");
         let backend = CrocBackend::new(&script);
         let request = ReceiveRequest::new("receiver-secret", "/tmp/out").unwrap();
+        let args = backend.receive_args(&request).unwrap();
         let output = backend
-            .receive(request)
+            .spawn(args, "receive", Some(&request.code), false)
             .await
             .unwrap()
-            .wait()
+            .wait_with_diagnostics()
             .await
             .unwrap();
-        let output = String::from_utf8(output.stdout).unwrap();
+        let output = String::from_utf8(output.0).unwrap();
         assert!(output.contains("--out /tmp/out"));
         assert!(output.contains("secret=[REDACTED]"));
         assert!(!output.contains("receiver-secret"));
@@ -930,7 +978,12 @@ mod tests {
             .wait()
             .await
             .unwrap_err();
-        assert!(matches!(error, BackendError::OutputParse { .. }));
+        assert!(matches!(
+            error,
+            BackendError::Protocol {
+                reason: BackendProtocolError::MalformedMessage,
+            }
+        ));
         let _ = std::fs::remove_file(malformed);
 
         let missing = versioned_script("printf 'Sending file (1 MB)\\n'");
@@ -944,8 +997,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            BackendError::MissingSignal {
-                signal: "transfer code"
+            BackendError::Protocol {
+                reason: BackendProtocolError::MissingRequiredSignal,
             }
         ));
         let _ = std::fs::remove_file(missing);
@@ -958,21 +1011,23 @@ mod tests {
             "dd if=/dev/zero bs=1024 count=80 2>/dev/null | tr '\\0' x >&2; printf '\\nCode is: bounded-code\\n' >&2",
         );
         let backend = CrocBackend::new(&script);
+        let request = SendRequest::new(vec![PathBuf::from("ignored")]).unwrap();
+        let args = backend.send_args(&request).unwrap();
         let output = backend
-            .send(SendRequest::new(vec![PathBuf::from("ignored")]).unwrap())
+            .spawn(args, "send", None, true)
             .await
             .unwrap()
-            .wait()
+            .wait_with_diagnostics()
             .await
             .unwrap();
-        assert!(output.stderr.len() <= DIAGNOSTIC_LIMIT + 32);
-        assert!(String::from_utf8_lossy(&output.stderr).contains("output truncated"));
+        assert!(output.1.len() <= DIAGNOSTIC_LIMIT + 32);
+        assert!(String::from_utf8_lossy(&output.1).contains("output truncated"));
         let _ = std::fs::remove_file(script);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn maps_non_zero_exit_code_and_stderr() {
+    async fn maps_non_zero_exit_to_neutral_error() {
         let script = versioned_script("printf 'failed\\n' >&2; exit 7");
         let backend = CrocBackend::new(&script);
         let request = SendRequest::new(vec![PathBuf::from("ignored")]).unwrap();
@@ -985,10 +1040,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            BackendError::ProcessFailed {
-                code: Some(7),
-                stderr
-            } if stderr == "failed"
+            BackendError::OperationFailed {
+                reason: BackendOperationError::ExecutionFailed,
+            }
         ));
         let _ = std::fs::remove_file(script);
     }
