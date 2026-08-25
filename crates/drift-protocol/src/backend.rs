@@ -89,8 +89,11 @@ impl fmt::Display for BackendRequestError {
 pub enum BackendProtocolError {
     VersionCheckFailed,
     UnrecognizedVersion,
+    UnsupportedVersion,
     MalformedMessage,
     MissingRequiredSignal,
+    ResourceLimit,
+    InvalidState,
 }
 
 impl BackendProtocolError {
@@ -98,8 +101,11 @@ impl BackendProtocolError {
         match self {
             Self::VersionCheckFailed => "backend version check failed",
             Self::UnrecognizedVersion => "backend version was not recognized",
+            Self::UnsupportedVersion => "backend protocol version is unsupported",
             Self::MalformedMessage => "backend protocol response was not recognized",
             Self::MissingRequiredSignal => "backend did not provide a required signal",
+            Self::ResourceLimit => "backend protocol resource limit was exceeded",
+            Self::InvalidState => "backend protocol state was invalid",
         }
     }
 }
